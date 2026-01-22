@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import re
 
-from PIL import Image
+from PIL import Image, ImageDraw
 import pytesseract
 
 
@@ -57,6 +57,7 @@ def ocr_image(path: Path, lang: str) -> Dict[str, Any]:
         "text": text.strip(),
         "first_word": first_word,
         "last_word": last_word,
+        "words": words,
     }
 
 
@@ -132,6 +133,16 @@ def main() -> None:
         default="text_type.csv",
         help="CSV mapping filename -> type (default: text_type.csv).",
     )
+    parser.add_argument(
+        "--debug-dir",
+        default="debug_images",
+        help="Output directory for debug images (default: debug_images).",
+    )
+    parser.add_argument(
+        "--ocr-text-dir",
+        default="ocr_text",
+        help="Output directory for per-image OCR text (default: ocr_text).",
+    )
     args = parser.parse_args()
 
     benchmark_dir = Path(args.benchmark_dir)
@@ -146,10 +157,30 @@ def main() -> None:
     kadesh_text = _strip_newlines(_read_text_file(root, "kadesh"))
     peter_text = _strip_newlines(_read_text_file(root, "peter"))
 
+    debug_dir = Path(args.debug_dir)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    ocr_text_dir = Path(args.ocr_text_dir)
+    ocr_text_dir.mkdir(parents=True, exist_ok=True)
+
     for path in iter_images(benchmark_dir):
         image_type = type_map.get(path.name)
         result = ocr_image(path, lang=args.lang)
         ocr_text = _strip_newlines(result["text"])
+        words = result["words"]
+        if words:
+            left = min(w["x1"] for w in words)
+            right = max(w["x2"] for w in words)
+            top = min(w["y1"] for w in words)
+            bottom = max(w["y2"] for w in words)
+            image = Image.open(path).convert("RGB")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([left, top, right, bottom], outline=(255, 0, 0), width=3)
+            for w in words:
+                draw.rectangle([w["x1"], w["y1"], w["x2"], w["y2"]], outline=(0, 200, 0), width=2)
+            out_path = debug_dir / f"{path.stem}_debug.png"
+            image.save(out_path)
+        text_out = ocr_text_dir / f"{path.stem}.txt"
+        text_out.write_text(result["text"], encoding="utf-8")
         # print(f"image: {result['image']}")
         # print("text:")
         # print(_reverse_lines(result["text"]))
