@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import re
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 import pytesseract
 
 
@@ -45,10 +45,22 @@ def _reading_order_hebrew(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(words, key=lambda w: (w["y1"], -w["x2"]))
 
 
+def _preprocess_image(image: Image.Image) -> Image.Image:
+    # Simplify image gently: grayscale -> light contrast stretch -> lift shadows.
+    gray = ImageOps.grayscale(image)
+    gray = ImageOps.autocontrast(gray, cutoff=1)
+    # Gamma < 1 lifts shadows without hard binarization.
+    gamma = 0.85
+    gray = gray.point(lambda p: int(255 * ((p / 255) ** gamma)))
+    gray = gray.filter(ImageFilter.MedianFilter(size=3))
+    return gray
+
+
 def ocr_image(path: Path, lang: str) -> Dict[str, Any]:
     image = Image.open(path)
-    text = pytesseract.image_to_string(image, lang=lang)
-    words = _word_boxes(image, lang=lang)
+    pre = _preprocess_image(image)
+    words = _word_boxes(pre, lang=lang)
+    text = pytesseract.image_to_string(pre, lang=lang)
     ordered = _reading_order_hebrew(words)
     first_word = ordered[0] if ordered else None
     last_word = ordered[-1] if ordered else None
@@ -143,6 +155,11 @@ def main() -> None:
         default="ocr_text",
         help="Output directory for per-image OCR text (default: ocr_text).",
     )
+    parser.add_argument(
+        "--preprocessed-dir",
+        default="preprocessed",
+        help="Output directory for preprocessed images (default: preprocessed).",
+    )
     args = parser.parse_args()
 
     benchmark_dir = Path(args.benchmark_dir)
@@ -161,6 +178,8 @@ def main() -> None:
     debug_dir.mkdir(parents=True, exist_ok=True)
     ocr_text_dir = Path(args.ocr_text_dir)
     ocr_text_dir.mkdir(parents=True, exist_ok=True)
+    preprocessed_dir = Path(args.preprocessed_dir)
+    preprocessed_dir.mkdir(parents=True, exist_ok=True)
 
     for path in iter_images(benchmark_dir):
         image_type = type_map.get(path.name)
@@ -179,6 +198,9 @@ def main() -> None:
                 draw.rectangle([w["x1"], w["y1"], w["x2"], w["y2"]], outline=(0, 200, 0), width=2)
             out_path = debug_dir / f"{path.stem}_debug.png"
             image.save(out_path)
+            pre = _preprocess_image(Image.open(path))
+            pre_out = preprocessed_dir / f"{path.stem}_pre.png"
+            pre.save(pre_out)
         text_out = ocr_text_dir / f"{path.stem}.txt"
         text_out.write_text(result["text"], encoding="utf-8")
         # print(f"image: {result['image']}")
