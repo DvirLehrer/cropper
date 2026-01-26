@@ -26,6 +26,10 @@ No coding conventions are defined because there is no code. For consistency with
 - Prefer descriptive, lowercase ASCII filenames if you add new assets (e.g., `benchmark/scan-001.jpg`).
 - If non-ASCII names are required, keep them consistent with the existing naming scheme.
 
+## Output Conventions
+
+- When printing Hebrew text in scripts or debug outputs, always reverse the string for display.
+
 ## Testing Guidelines
 
 No tests exist. If you add tests in the future, document:
