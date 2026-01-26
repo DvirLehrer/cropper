@@ -27,7 +27,7 @@ def _levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 
-def _best_word_segment_distance_with_prefix(
+def _best_word_segment_distance_anywhere(
     line_text: str,
     target_words: List[str],
     word_lens: List[int],
@@ -73,38 +73,56 @@ def find_best_sequences(
     window_words: int = 6,
     max_skip: int = 6,
     top_k: int = 5,
+    first_line_words: int = 5,
 ) -> List[Tuple[float, int, Tuple[int, int]]]:
     """Return best substrings (score, line_idx, (start,end))."""
     target_words = [w for w in target_text.split() if w]
+    first_target = " ".join(target_words[:first_line_words])
     word_lens = [len(w) for w in target_words]
     prefix = [0] * (len(word_lens) + 1)
     for i, l in enumerate(word_lens):
         prefix[i + 1] = prefix[i] + l
 
     scored: List[Tuple[float, int, Tuple[int, int]]] = []
+    best_prefix: Tuple[float, int, Tuple[int, int]] | None = None
     for idx, words in enumerate(line_words):
-        if not words or len(words) < window_words:
+        if not words:
             continue
         ordered = sorted(words, key=lambda w: -w["x2"])
-        best = None
         max_start = min(max_skip, max(len(ordered) - 1, 0))
+
+        if first_target:
+            prefix_best = None
+            for start in range(0, max_start + 1):
+                for end in range(start, len(ordered)):
+                    ocr_sub = " ".join(w["text"] for w in ordered[start : end + 1])
+                    dist = _levenshtein(ocr_sub, first_target)
+                    denom = max(len(first_target), 1)
+                    score = 1.0 - (dist / denom)
+                    if prefix_best is None or score > prefix_best[0]:
+                        prefix_best = (score, idx, (start, end))
+            if prefix_best and (best_prefix is None or prefix_best[0] > best_prefix[0]):
+                best_prefix = prefix_best
+
+        if len(ordered) < window_words:
+            continue
+        best = None
         for start in range(0, max_start + 1):
-            if start >= len(ordered):
-                break
             end = min(len(ordered), start + window_words) - 1
             if end - start + 1 < window_words:
                 continue
             ocr_sub = " ".join(w["text"] for w in ordered[start : end + 1])
-            dist, segment = _best_word_segment_distance_with_prefix(
+            dist, segment = _best_word_segment_distance_anywhere(
                 ocr_sub, target_words, word_lens, prefix
             )
             denom = max(len(segment), 1)
             score = 1.0 - (dist / denom)
             if best is None or score > best[0]:
-                best = (score, start, end)
+                best = (score, idx, (start, end))
         if best is None:
             continue
-        score, start, end = best
-        scored.append((score, idx, (start, end)))
-    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        scored.append(best)
+
+    if best_prefix:
+        scored = [best_prefix] + [s for s in scored if s[1] != best_prefix[1]]
     return scored[:top_k]
