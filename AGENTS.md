@@ -25,6 +25,7 @@ No coding conventions are defined because there is no code. For consistency with
 - Keep image files in `benchmark/`.
 - Prefer descriptive, lowercase ASCII filenames if you add new assets (e.g., `benchmark/scan-001.jpg`).
 - If non-ASCII names are required, keep them consistent with the existing naming scheme.
+- a source file should not exceed 200 lines of code. if needed write seperate modules and import.
 
 ## Output Conventions
 
