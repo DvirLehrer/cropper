@@ -128,6 +128,16 @@ def _best_char_substring(target_text: str, ocr_text: str) -> Tuple[int, int, str
     return best_start, best_end, best_sub, best_dist
 
 
+def _median(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    values = sorted(values)
+    mid = len(values) // 2
+    if len(values) % 2 == 1:
+        return float(values[mid])
+    return float(values[mid - 1] + values[mid]) / 2.0
+
+
 def _best_window_for_line(
     words: List[Dict[str, Any]],
     target_words: List[str],
@@ -213,30 +223,23 @@ def main() -> None:
     expected_start_x = x2 + (t_start1 * letter_size)
 
     t_start1_dbg, t_end1_dbg, t_sub1_dbg, _ = _best_char_substring(target, ocr_sub)
-    line_chars = t_end1_dbg
+    words = target.split()
+    if not words:
+        raise SystemExit("empty target text")
+    line_text = ""
+    line_chars = 0
+    running = 0
+    for i, w in enumerate(words):
+        add = len(w) if i == 0 else len(w) + 1
+        running += add
+        line_text = " ".join(words[: i + 1])
+        line_chars = len(line_text)
+        if running >= t_end1_dbg:
+            break
     if line_chars <= 0:
         raise SystemExit("invalid line length (chars)")
     line_px = line_chars * letter_size
 
-    total_chars = len(target)
-    line_count = (total_chars + line_chars - 1) // line_chars
-    line_height = max(1.0, y2 - y1)
-    doc_height = line_height * line_count
-    doc_right = expected_start_x
-    doc_left = doc_right - line_px
-    doc_top = y1
-    doc_bottom = doc_top + doc_height
-
-    print("line length derivation:")
-    print(f"  line1 ocr span: {ocr_sub[::-1]}")
-    print(f"  line1 target segment: {t_sub1_dbg[::-1]}")
-    print(f"  line1 target start: {t_start1_dbg}")
-    line_text = target[:t_end1_dbg]
-    print(f"  line text (for line length): {line_text[::-1]}")
-    print(f"  line length chars: {len(line_text)}")
-
-    print("expected text lines (word-wrapped):")
-    words = target.split()
     lines: List[str] = []
     current: List[str] = []
     current_len = 0
@@ -251,6 +254,26 @@ def main() -> None:
             current_len += extra
     if current:
         lines.append(" ".join(current))
+    line_count = len(lines)
+
+    word_heights = [
+        w["y2"] - w["y1"] for w in result.get("words", []) if w.get("y2") is not None
+    ]
+    line_height = _median(word_heights) or max(1.0, y2 - y1)
+    doc_height = line_height * line_count
+    doc_right = expected_start_x
+    doc_left = doc_right - line_px
+    doc_top = y1
+    doc_bottom = doc_top + doc_height
+
+    print("line length derivation:")
+    print(f"  line1 ocr span: {ocr_sub[::-1]}")
+    print(f"  line1 target segment: {t_sub1_dbg[::-1]}")
+    print(f"  line1 target start: {t_start1_dbg}")
+    print(f"  line text (for line length): {line_text[::-1]}")
+    print(f"  line length chars: {len(line_text)}")
+
+    print("expected text lines (word-wrapped):")
     for i, segment in enumerate(lines):
         print(f"  line {i:02d}: {segment[::-1]}")
 

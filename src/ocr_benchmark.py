@@ -10,7 +10,7 @@ Dependencies:
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from PIL import Image, ImageDraw
 
@@ -24,34 +24,37 @@ from cropper_config import (
     TYPES_CSV,
 )
 from target_texts import load_target_texts, strip_newlines
-from best_sequence import find_best_sequences
+from expected_layout import estimate_layout
 from ocr_utils import iter_images, levenshtein, load_types, ocr_image, preprocess_image
 
-TOP_K = 5
 WINDOW_WORDS = 6
 MAX_SKIP = 6
 
 
-def _draw_best_sequences(
+def _draw_expected_layout(
     image: Image.Image,
+    words: List[Dict[str, Any]],
     line_words: List[List[Dict[str, Any]]],
     target_text: str,
+    boundary_word_index: int | None = None,
 ) -> None:
-    scored = find_best_sequences(
+    layout = estimate_layout(
         line_words,
+        words,
         target_text,
         window_words=WINDOW_WORDS,
         max_skip=MAX_SKIP,
-        top_k=TOP_K,
+        score_threshold=0.4,
+        boundary_word_index=boundary_word_index,
     )
+    if not layout:
+        return
     draw = ImageDraw.Draw(image)
-    for _, idx, (i, j) in scored:
-        span_words = sorted(line_words[idx], key=lambda w: -w["x2"])[i : j + 1]
-        x1 = min(w["x1"] for w in span_words)
-        y1 = min(w["y1"] for w in span_words)
-        x2 = max(w["x2"] for w in span_words)
-        y2 = max(w["y2"] for w in span_words)
-        draw.rectangle([x1, y1, x2, y2], outline=(160, 0, 255), width=3)
+    doc_left, doc_top, doc_right, doc_bottom = layout["doc_box"]
+    draw.rectangle([doc_left, doc_top, doc_right, doc_bottom], outline=(0, 255, 255), width=3)
+    exp_x = int(round(layout["expected_start_x"]))
+    exp_x = max(0, min(exp_x, image.width - 1))
+    draw.line([(exp_x, doc_top), (exp_x, doc_top + 20)], fill=(255, 0, 0), width=3)
 
 
 def main() -> None:
@@ -104,9 +107,10 @@ def main() -> None:
             draw.rectangle([left, top, right, bottom], outline=(255, 0, 0), width=3)
             for w in words:
                 draw.rectangle([w["x1"], w["y1"], w["x2"], w["y2"]], outline=(0, 200, 0), width=2)
-            for idx, line in enumerate(line_bboxes, start=1):
-                draw.rectangle([line["x1"], line["y1"], line["x2"], line["y2"]], outline=(0, 128, 255), width=2)
-            _draw_best_sequences(image, line_words, target_for_image)
+            boundary_word_index = None
+            if image_type == "m":
+                boundary_word_index = len(target_texts["shema"].split())
+            _draw_expected_layout(image, words, line_words, target_for_image, boundary_word_index)
             out_path = debug_dir / f"{path.stem}_debug.png"
             image.save(out_path)
 

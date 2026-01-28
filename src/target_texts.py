@@ -32,5 +32,5 @@ def load_target_texts(text_dir: Path) -> Dict[str, str]:
         "vehaya": vehaya,
         "kadesh": kadesh,
         "peter": peter,
-        "m": shema + vehaya,
+        "m": f"{shema} {vehaya}",
     }
