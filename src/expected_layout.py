@@ -509,16 +509,34 @@ def estimate_layout(
     if line_width_px is None:
         return None
 
-    word_heights = [w["y2"] - w["y1"] for w in words if w.get("y2") is not None]
-    line_height = _median(word_heights) or max(1.0, chosen_sorted[0]["y2"] - chosen_sorted[0]["y1"])
+    line_tops = []
+    for line in line_words:
+        if not line:
+            continue
+        line_tops.append(min(w["y1"] for w in line))
+    line_tops.sort()
+    line_steps = [b - a for a, b in zip(line_tops, line_tops[1:]) if b > a]
+    line_height = _median(line_steps)
+    if not line_height:
+        word_heights = [w["y2"] - w["y1"] for w in words if w.get("y2") is not None]
+        line_height = _median(word_heights) or max(1.0, chosen_sorted[0]["y2"] - chosen_sorted[0]["y1"])
     line_count = len(lines)
     doc_right = expected_start_x
     doc_left = doc_right - line_width_px
 
     best_item = max(chosen, key=lambda item: item["score"])
+    # Map best_item t_start to a line index in the final layout.
+    best_word_idx = None
+    for wi, (ws, we) in enumerate(word_spans):
+        if we > best_item["t_start"]:
+            best_word_idx = wi
+            break
     lines_before = 0
-    if line_chars > 0:
-        lines_before = max(0, best_item["t_start"] // line_chars)
+    if best_word_idx is not None:
+        for li, (ws, we, _, _) in enumerate(lines):
+            if ws <= best_word_idx <= we:
+                lines_before = li
+                break
     doc_top = best_item["y1"] - (line_height * lines_before)
     if doc_top < 0:
         doc_top = 0.0
@@ -534,5 +552,6 @@ def estimate_layout(
         "line_chars": line_chars,
         "line_count": line_count,
         "line_height": line_height,
+        "lines": lines,
         "doc_box": (doc_left, doc_top, doc_right, doc_bottom),
     }

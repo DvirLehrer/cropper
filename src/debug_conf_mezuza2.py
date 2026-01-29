@@ -58,18 +58,21 @@ def main() -> None:
             }
         )
 
-    words.sort(key=lambda w: (w["line"], w["y1"], -w["x2"]))
-    current_line = None
+    words.sort(key=lambda w: (w["line"], w["y1"], w["x1"]))
+    lines: Dict[int, List[Dict[str, Any]]] = {}
     for w in words:
-        if w["line"] != current_line:
-            current_line = w["line"]
-            print(f"line {current_line:02d}:")
-        conf_str = "none" if w["conf"] is None else f"{w['conf']:.1f}"
-        print(
-            f"  conf={conf_str} "
-            f"bbox=({w['x1']},{w['y1']},{w['x2']},{w['y2']}) "
-            f"text={_display_hebrew(w['text'])}"
-        )
+        lines.setdefault(w["line"], []).append(w)
+
+    for line_idx in sorted(lines.keys()):
+        print(f"line {line_idx:02d}:")
+        line_words = sorted(lines[line_idx], key=lambda w: -w["x2"])
+        for w in line_words:
+            conf_str = "none" if w["conf"] is None else f"{w['conf']:.1f}"
+            print(
+                f"  conf={conf_str} "
+                f"bbox=({w['x1']},{w['y1']},{w['x2']},{w['y2']}) "
+                f"text={_display_hebrew(w['text'])}"
+            )
 
 
 if __name__ == "__main__":
