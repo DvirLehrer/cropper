@@ -92,7 +92,25 @@ def _box_edge_distance(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     return (dx * dx + dy * dy) ** 0.5
 
 
-def _filtered_bbox(words: List[Dict[str, Any]]) -> tuple[int, int, int, int] | None:
+def _box_to_rect_distance(box: Dict[str, Any], rect: tuple[float, float, float, float]) -> float:
+    left, top, right, bottom = rect
+    dx = 0.0
+    if box["x2"] < left:
+        dx = left - box["x2"]
+    elif right < box["x1"]:
+        dx = box["x1"] - right
+    dy = 0.0
+    if box["y2"] < top:
+        dy = top - box["y2"]
+    elif bottom < box["y1"]:
+        dy = box["y1"] - bottom
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _filtered_bbox(
+    words: List[Dict[str, Any]],
+    expected_box: tuple[float, float, float, float] | None = None,
+) -> tuple[int, int, int, int] | None:
     if not words:
         return None
     sizes = []
@@ -115,7 +133,10 @@ def _filtered_bbox(words: List[Dict[str, Any]]) -> tuple[int, int, int, int] | N
         if nearest is None:
             nearest = 0.0
         dist_units = nearest / max(median_size, 1e-6)
-        tol = 3.0 / (1.0 + dist_units)
+        outside_units = 0.0
+        if expected_box is not None:
+            outside_units = _box_to_rect_distance(w, expected_box) / max(median_size, 1e-6)
+        tol = 3.0 / (1.0 + dist_units + outside_units)
         if tol < 1.0:
             tol = 1.0
         min_size = median_size / tol
@@ -228,7 +249,7 @@ def main() -> None:
             score_threshold=0.4,
             boundary_word_index=boundary_word_index,
         )
-        detected_bbox = _filtered_bbox(words)
+        detected_bbox = _filtered_bbox(words, expected_layout["doc_box"] if expected_layout else None)
         crop_bbox = None
         image_full = Image.open(path).convert("RGB")
         if expected_layout:
@@ -263,7 +284,7 @@ def main() -> None:
             for w in words:
                 draw.rectangle([w["x1"], w["y1"], w["x2"], w["y2"]], outline=(0, 200, 0), width=2)
 
-            kept_bbox = _filtered_bbox(words)
+            kept_bbox = _filtered_bbox(words, expected_layout["doc_box"] if expected_layout else None)
             if kept_bbox:
                 left, top, right, bottom = kept_bbox
                 draw.rectangle([left, top, right, bottom], outline=(255, 0, 0), width=3)
