@@ -49,6 +49,8 @@ def _best_word_segment_distance_anywhere(
     target_len = len(line_text)
     best_dist = 10**9
     best_segment = ""
+    seg_cache: Dict[Tuple[int, int], str] = {}
+    lev_cache: Dict[str, int] = {}
     for i in range(n):
         j_min = i
         while j_min < n and seg_len(i, j_min) < target_len - length_tolerance:
@@ -57,8 +59,17 @@ def _best_word_segment_distance_anywhere(
         while j_max < n and seg_len(i, j_max) <= target_len:
             j_max += 1
         for j in range(j_min, j_max):
-            segment = " ".join(target_words[i : j + 1])
-            dist = _levenshtein(line_text, segment)
+            key = (i, j)
+            if key in seg_cache:
+                segment = seg_cache[key]
+            else:
+                segment = " ".join(target_words[i : j + 1])
+                seg_cache[key] = segment
+            if segment in lev_cache:
+                dist = lev_cache[segment]
+            else:
+                dist = _levenshtein(line_text, segment)
+                lev_cache[segment] = dist
             if dist < best_dist:
                 best_dist = dist
                 best_segment = segment
@@ -89,18 +100,30 @@ def find_best_sequences(
         if not words:
             continue
         ordered = sorted(words, key=lambda w: -w["x2"])
+        ordered_texts = [w["text"] for w in ordered]
+        sub_cache: Dict[Tuple[int, int], str] = {}
+
+        def _sub(start: int, end: int) -> str:
+            key = (start, end)
+            if key in sub_cache:
+                return sub_cache[key]
+            text = " ".join(ordered_texts[start : end + 1])
+            sub_cache[key] = text
+            return text
         max_start = min(max_skip, max(len(ordered) - 1, 0))
 
-        if first_target:
+        if first_target and len(ordered) >= window_words:
             prefix_best = None
             for start in range(0, max_start + 1):
-                for end in range(start, len(ordered)):
-                    ocr_sub = " ".join(w["text"] for w in ordered[start : end + 1])
-                    dist = _levenshtein(ocr_sub, first_target)
-                    denom = max(len(first_target), 1)
-                    score = 1.0 - (dist / denom)
-                    if prefix_best is None or score > prefix_best[0]:
-                        prefix_best = (score, idx, (start, end))
+                end = min(len(ordered), start + window_words) - 1
+                if end < start:
+                    continue
+                ocr_sub = _sub(start, end)
+                dist = _levenshtein(ocr_sub, first_target)
+                denom = max(len(first_target), 1)
+                score = 1.0 - (dist / denom)
+                if prefix_best is None or score > prefix_best[0]:
+                    prefix_best = (score, idx, (start, end))
             if prefix_best and (best_prefix is None or prefix_best[0] > best_prefix[0]):
                 best_prefix = prefix_best
 
@@ -111,7 +134,7 @@ def find_best_sequences(
             end = min(len(ordered), start + window_words) - 1
             if end - start + 1 < window_words:
                 continue
-            ocr_sub = " ".join(w["text"] for w in ordered[start : end + 1])
+            ocr_sub = _sub(start, end)
             dist, segment = _best_word_segment_distance_anywhere(
                 ocr_sub, target_words, word_lens, prefix
             )

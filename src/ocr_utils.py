@@ -9,13 +9,26 @@ from typing import Any, Dict, List, Tuple
 from PIL import Image, ImageFilter, ImageOps
 import pytesseract
 
+OCR_CONFIG = "--psm 4"
 
-def preprocess_image(image: Image.Image) -> Image.Image:
+
+def preprocess_image(
+    image: Image.Image,
+    *,
+    upscale_factor: float = 1.0,
+    sharpen: bool = False,
+) -> Image.Image:
+    if upscale_factor != 1.0:
+        new_w = max(1, int(round(image.width * upscale_factor)))
+        new_h = max(1, int(round(image.height * upscale_factor)))
+        image = image.resize((new_w, new_h), Image.LANCZOS)
     gray = ImageOps.grayscale(image)
     gray = ImageOps.autocontrast(gray, cutoff=1)
     gamma = 0.85
     gray = gray.point(lambda p: int(255 * ((p / 255) ** gamma)))
     gray = gray.filter(ImageFilter.MedianFilter(size=3))
+    if sharpen:
+        gray = gray.filter(ImageFilter.UnsharpMask(radius=2, percent=160, threshold=3))
     return gray
 
 
@@ -96,7 +109,7 @@ def ocr_image(path: Path, lang: str) -> Dict[str, Any]:
     data = pytesseract.image_to_data(
         pre,
         lang=lang,
-        config="--psm 4",
+        config=OCR_CONFIG,
         output_type=pytesseract.Output.DICT,
     )
     words = word_boxes_from_data(data)
@@ -120,7 +133,19 @@ def load_types(csv_path: Path) -> Dict[str, str]:
         import csv
 
         reader = csv.DictReader(f)
-        return {row["filename"]: row["type"] for row in reader if row.get("filename")}
+        mapping: Dict[str, str] = {}
+        for row in reader:
+            filename = row.get("filename")
+            if not filename:
+                continue
+            f_clean = filename.strip()
+            f_norm = " ".join(f_clean.split())
+            f_type = row.get("type")
+            if not f_type:
+                continue
+            mapping[f_clean] = f_type
+            mapping[f_norm] = f_type
+        return mapping
 
 
 def levenshtein(a: str, b: str) -> int:

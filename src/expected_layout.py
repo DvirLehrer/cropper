@@ -51,6 +51,8 @@ def _best_word_segment_distance_anywhere(
     target_len = len(line_text)
     best_dist = 10**9
     best_segment = ""
+    seg_cache: Dict[Tuple[int, int], str] = {}
+    lev_cache: Dict[str, int] = {}
     for i in range(n):
         j_min = i
         while j_min < n and seg_len(i, j_min) < target_len - length_tolerance:
@@ -59,8 +61,17 @@ def _best_word_segment_distance_anywhere(
         while j_max < n and seg_len(i, j_max) <= target_len:
             j_max += 1
         for j in range(j_min, j_max):
-            segment = " ".join(target_words[i : j + 1])
-            dist = _levenshtein(line_text, segment)
+            key = (i, j)
+            if key in seg_cache:
+                segment = seg_cache[key]
+            else:
+                segment = " ".join(target_words[i : j + 1])
+                seg_cache[key] = segment
+            if segment in lev_cache:
+                dist = lev_cache[segment]
+            else:
+                dist = _levenshtein(line_text, segment)
+                lev_cache[segment] = dist
             if dist < best_dist:
                 best_dist = dist
                 best_segment = segment
@@ -145,13 +156,23 @@ def _best_window_for_line(
     ordered = sorted(words, key=lambda w: -w["x2"])
     if len(ordered) < window_words:
         return None
+    ordered_texts = [w["text"] for w in ordered]
+    sub_cache: Dict[Tuple[int, int], str] = {}
+
+    def _sub(start: int, end: int) -> str:
+        key = (start, end)
+        if key in sub_cache:
+            return sub_cache[key]
+        text = " ".join(ordered_texts[start : end + 1])
+        sub_cache[key] = text
+        return text
     max_start = min(max_skip, max(len(ordered) - 1, 0))
     best = None
     for start in range(0, max_start + 1):
         end = min(len(ordered), start + window_words) - 1
         if end - start + 1 < window_words:
             continue
-        ocr_sub = " ".join(w["text"] for w in ordered[start : end + 1])
+        ocr_sub = _sub(start, end)
         dist, segment = _best_word_segment_distance_anywhere(
             ocr_sub, target_words, word_lens, prefix
         )
@@ -174,18 +195,23 @@ def estimate_layout(
     if not target_text or not line_words:
         return None
 
+    line_index_map = list(range(len(line_words)))
+
     scored = find_best_sequences(
         line_words,
         target_text,
         window_words=window_words,
         max_skip=max_skip,
-        top_k=10**6,
+        top_k=120,
     )
     if not scored:
         return None
 
+    if line_index_map:
+        scored = [(s, line_index_map[idx], span) for (s, idx, span) in scored]
+
     scored = sorted(scored, key=lambda item: item[0], reverse=True)
-    keep_n = max(3, int(len(scored) * 0.30))
+    keep_n = max(3, int(len(scored) * 0.20))
     score_keep = [item for item in scored if item[0] >= 0.7]
     keep_n = max(keep_n, len(score_keep))
     kept = scored[:keep_n]
@@ -371,6 +397,8 @@ def estimate_layout(
                     cost = 0
                 else:
                     cost = 0 if not line_chars else (length - line_chars) ** 2
+                    if line_chars and length > line_chars:
+                        break
                 total = cost + dp[j]
                 if best_cost is None or total < best_cost:
                     best_cost = total
@@ -419,6 +447,8 @@ def estimate_layout(
                         cost = 0
                     else:
                         cost = 0 if not line_chars else (length - line_chars) ** 2
+                        if line_chars and length > line_chars:
+                            break
                     if dp[j][k - 1] is None:
                         continue
                     total = cost + dp[j][k - 1]
@@ -451,14 +481,20 @@ def estimate_layout(
                 break
 
     if boundary_token is None:
-        lines = build_lines_fixed_count(tokens, target_line_count) if target_line_count else build_lines(tokens)
+        if target_line_count and len(tokens) <= 400:
+            lines = build_lines_fixed_count(tokens, target_line_count)
+        else:
+            lines = build_lines(tokens)
     else:
         if target_line_count is None:
             lines = build_lines(tokens[:boundary_token]) + build_lines(tokens[boundary_token:])
         else:
             shema_lines = build_lines(tokens[:boundary_token])
             remaining = max(1, target_line_count - len(shema_lines))
-            lines = shema_lines + build_lines_fixed_count(tokens[boundary_token:], remaining)
+            if len(tokens) <= 400:
+                lines = shema_lines + build_lines_fixed_count(tokens[boundary_token:], remaining)
+            else:
+                lines = shema_lines + build_lines(tokens[boundary_token:])
 
     if not lines:
         return None
