@@ -28,13 +28,29 @@ from cropper_config import (
     TYPES_CSV,
 )
 from target_texts import load_target_texts, strip_newlines
-from expected_layout import estimate_layout
+from layout_engine import get_layout_engine
 from edge_align_shift import align_edges_shift_side
-from ocr_utils import iter_images, levenshtein, load_types, preprocess_image
+from ocr_utils import iter_images, levenshtein, load_types, preprocess_image, text_from_words
+from line_structure import (
+    build_line_models,
+    line_segments,
+    build_mesh,
+    build_pil_mesh,
+    warp_word_boxes,
+)
+from line_correction import decide_correction, apply_tilt
+from slice_debug import explore_margin_slices
 
 WINDOW_WORDS = 6
 MAX_SKIP = 6
-DRAW_EXPECTED_LAYOUT = False
+DRAW_EXPECTED_LAYOUT = True
+LAYOUT_ENGINE = "seq_target"
+CROP_LAYOUT_ENGINE = ""
+MISSING_SLICE_THRESHOLD = 0.1
+ENABLE_LAYOUT_ENGINE = False
+ENABLE_SLICE_EXPLORATION = False
+ENABLE_LINE_WARP = True
+APPLY_LINE_CORRECTION = True
 STRIPE_HEIGHT_FRACS = (0.15, 0.25, 0.35, 0.5)
 STRIPE_OVERLAP = 0.5
 STRIPE_TOP_K = 2
@@ -256,17 +272,19 @@ def _mad(xs: List[float], center: float) -> float:
 def _filter_boxes_by_char_size(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not words:
         return []
-    sizes = []
-    for w in words:
-        text = w.get("text", "")
-        char_count = max(len(text), 1)
-        sizes.append((w["x2"] - w["x1"]) / char_count)
-    median_size = _median(sizes)
-    if median_size <= 0:
+    widths = [w["x2"] - w["x1"] for w in words]
+    heights = [w["y2"] - w["y1"] for w in words]
+    mean_w = sum(widths) / len(widths)
+    mean_h = sum(heights) / len(heights)
+    if mean_w <= 0 or mean_h <= 0:
         return list(words)
-    min_size = median_size / 3.0
-    max_size = median_size * 3.0
-    kept = [w for w, size in zip(words, sizes) if min_size <= size <= max_size]
+    kept = []
+    for w, width, height in zip(words, widths, heights):
+        w_bad = width < (0.5 * mean_w) or width > (2.0 * mean_w)
+        h_bad = height < (0.5 * mean_h) or height > (2.0 * mean_h)
+        if w_bad and h_bad:
+            continue
+        kept.append(w)
     return kept if kept else list(words)
 
 
@@ -414,6 +432,7 @@ def _ocr_image_pil(
             "words": words,
             "line_bboxes": line_bboxes,
             "line_words": line_words,
+            "preprocessed": pre,
         }
 
     used_image = image
@@ -436,6 +455,53 @@ def _ocr_image_pil(
     result["image"] = "in-memory"
     result["image_pil"] = used_image
     return result
+
+
+def _ocr_image_pil_sparse_merge(
+    image: Image.Image,
+    lang: str,
+) -> Dict[str, Any]:
+    base = _ocr_image_pil(image, lang=lang, allow_rotate=False)
+    pre = base["preprocessed"]
+    data = pytesseract.image_to_data(
+        pre,
+        lang=lang,
+        config="--psm 11",
+        output_type=pytesseract.Output.DICT,
+    )
+    from ocr_utils import word_boxes_from_data, text_from_words
+
+    sparse_words = word_boxes_from_data(data)
+
+    def _overlaps(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+        x1 = max(a["x1"], b["x1"])
+        y1 = max(a["y1"], b["y1"])
+        x2 = min(a["x2"], b["x2"])
+        y2 = min(a["y2"], b["y2"])
+        if x2 <= x1 or y2 <= y1:
+            return False
+        inter = (x2 - x1) * (y2 - y1)
+        area = (a["x2"] - a["x1"]) * (a["y2"] - a["y1"])
+        if area <= 0:
+            return False
+        return (inter / area) > 0.3
+
+    merged = list(base["words"])
+    for w in sparse_words:
+        if any(_overlaps(w, k) for k in merged):
+            continue
+        merged.append(w)
+
+    text, line_bboxes, line_words = text_from_words(merged)
+    base.update(
+        {
+            "text": text.strip(),
+            "words": merged,
+            "line_bboxes": line_bboxes,
+            "line_words": line_words,
+        }
+    )
+    return base
 
 
 def _clamp_layout_to_image(layout: Dict[str, Any], width: int, height: int) -> Dict[str, Any]:
@@ -486,6 +552,8 @@ def main() -> None:
     preprocessed_dir.mkdir(parents=True, exist_ok=True)
     cropped_dir = CROPPED_DIR
     cropped_dir.mkdir(parents=True, exist_ok=True)
+    layout_engine = get_layout_engine(LAYOUT_ENGINE) if ENABLE_LAYOUT_ENGINE else None
+    crop_layout_engine = get_layout_engine(CROP_LAYOUT_ENGINE) if CROP_LAYOUT_ENGINE else None
 
     for path in iter_images(benchmark_dir):
         print(f"processing: {path.name}")
@@ -525,19 +593,146 @@ def main() -> None:
         line_words = result["line_words"]
 
         boundary_word_index = len(target_texts["shema"].split()) if image_type == "m" else None
-        expected_layout = estimate_layout(
-            line_words,
-            words,
-            target_for_image,
-            window_words=WINDOW_WORDS,
-            max_skip=MAX_SKIP,
-            score_threshold=0.4,
-            boundary_word_index=boundary_word_index,
+        expected_layout = None
+        structure_models = None
+        structure_xs = None
+        structure_ys = None
+        structure_grid = None
+        correction = decide_correction(line_words)
+        print(
+            f"correction: {correction.mode} "
+            f"(mean_abs={correction.mean_abs:.5f} std={correction.std:.5f} "
+            f"resid_mean={correction.resid_mean:.3f} resid_std={correction.resid_std:.3f} "
+            f"curve_std={correction.curve_std:.3f})"
         )
         t2 = time.perf_counter()
+        if ENABLE_LINE_WARP and APPLY_LINE_CORRECTION and correction.mode == "warp":
+            structure_models = build_line_models(line_words)
+            structure_xs, structure_ys, structure_grid = build_mesh(
+                structure_models, image_full.width, image_full.height, grid_step=80
+            )
+            mesh = build_pil_mesh(structure_xs, structure_ys, structure_grid)
+            if mesh:
+                image_full = image_full.transform(image_full.size, Image.MESH, mesh, resample=Image.BICUBIC)
+                warp_result = _ocr_image_pil_sparse_merge(image_full, lang=LANG)
+                words = warp_result["words"]
+                line_words = warp_result["line_words"]
+                warp_input = warp_result["preprocessed"].convert("RGB")
+                warp_input_draw = ImageDraw.Draw(warp_input)
+                for w in words:
+                    warp_input_draw.rectangle([w["x1"], w["y1"], w["x2"], w["y2"]], outline=(0, 200, 0), width=2)
+                warp_input_out = debug_dir / f"{path.stem}_warp_ocr_input.png"
+                warp_input.save(warp_input_out)
+                warp_overlay = image_full.copy()
+                warp_draw = ImageDraw.Draw(warp_overlay)
+                for w in words:
+                    warp_draw.rectangle([w["x1"], w["y1"], w["x2"], w["y2"]], outline=(0, 200, 0), width=2)
+                warp_cluster = _cluster_bbox(words, return_cluster=True)
+                warp_bbox = warp_cluster[0] if warp_cluster else None
+                if warp_bbox:
+                    left, top, right, bottom = warp_bbox
+                    warp_draw.rectangle([left, top, right, bottom], outline=(255, 0, 0), width=3)
+                warp_out = debug_dir / f"{path.stem}_warp.png"
+                warp_overlay.save(warp_out)
+        elif ENABLE_LINE_WARP and APPLY_LINE_CORRECTION and correction.mode == "tilt":
+            image_full = apply_tilt(image_full, words, correction.slope)
+            tilt_result = _ocr_image_pil_sparse_merge(image_full, lang=LANG)
+            words = tilt_result["words"]
+            line_words = tilt_result["line_words"]
+            tilt_input = tilt_result["preprocessed"].convert("RGB")
+            tilt_input_draw = ImageDraw.Draw(tilt_input)
+            for w in words:
+                tilt_input_draw.rectangle([w["x1"], w["y1"], w["x2"], w["y2"]], outline=(0, 200, 0), width=2)
+            tilt_input_out = debug_dir / f"{path.stem}_tilt_ocr_input.png"
+            tilt_input.save(tilt_input_out)
+            tilt_overlay = image_full.copy()
+            tilt_draw = ImageDraw.Draw(tilt_overlay)
+            for w in words:
+                tilt_draw.rectangle([w["x1"], w["y1"], w["x2"], w["y2"]], outline=(0, 200, 0), width=2)
+            tilt_cluster = _cluster_bbox(words, return_cluster=True)
+            tilt_bbox = tilt_cluster[0] if tilt_cluster else None
+            if tilt_bbox:
+                left, top, right, bottom = tilt_bbox
+                tilt_draw.rectangle([left, top, right, bottom], outline=(255, 0, 0), width=3)
+            tilt_out = debug_dir / f"{path.stem}_tilt.png"
+            tilt_overlay.save(tilt_out)
+
         cluster_result = _cluster_bbox(words, return_cluster=True)
         detected_bbox = cluster_result[0] if cluster_result else None
+        pre_missing_ratio = None
+        if layout_engine:
+            pre_expected_layout = layout_engine.estimate(
+                line_words,
+                words,
+                target_for_image,
+                window_words=WINDOW_WORDS,
+                max_skip=MAX_SKIP,
+                score_threshold=0.4,
+                boundary_word_index=boundary_word_index,
+            )
+            if pre_expected_layout and "target_gaps" in pre_expected_layout:
+                gaps = pre_expected_layout["target_gaps"]
+                missing_len = sum(len(gap) for gap in gaps)
+                denom = max(len(target_for_image), 1)
+                pre_missing_ratio = missing_len / denom
         crop_bbox = None
+        if (
+            ENABLE_SLICE_EXPLORATION
+            and layout_engine
+            and
+            pre_missing_ratio is not None
+            and pre_missing_ratio >= MISSING_SLICE_THRESHOLD
+            and detected_bbox
+        ):
+            integration_results = explore_margin_slices(
+                base_image,
+                detected_bbox,
+                words,
+                LANG,
+            )
+            if integration_results:
+                added_words = [w for r in integration_results for w in r.words]
+                merged_words = words + added_words
+                merged_text, _, merged_line_words = text_from_words(merged_words)
+                merged_text = strip_newlines(merged_text)
+                after_layout = layout_engine.estimate(
+                    merged_line_words,
+                    merged_words,
+                    target_for_image,
+                    window_words=WINDOW_WORDS,
+                    max_skip=MAX_SKIP,
+                    score_threshold=0.4,
+                    boundary_word_index=boundary_word_index,
+                )
+                after_missing_ratio = None
+                if after_layout and "target_gaps" in after_layout:
+                    gaps = after_layout["target_gaps"]
+                    missing_len = sum(len(gap) for gap in gaps)
+                    denom = max(len(target_for_image), 1)
+                    after_missing_ratio = missing_len / denom
+
+                improved = False
+                if after_missing_ratio is not None and pre_missing_ratio is not None:
+                    improved = after_missing_ratio < pre_missing_ratio
+
+                if after_missing_ratio is not None and pre_missing_ratio is not None:
+                    print(
+                        "slice integration: "
+                        f"missing {pre_missing_ratio:.3f} -> {after_missing_ratio:.3f}"
+                    )
+
+                if improved:
+                    words = merged_words
+                    line_words = merged_line_words
+                    for r in integration_results:
+                        x1, y1, x2, y2 = r.bbox
+                        out_path = debug_dir / f"{path.stem}_slice_{r.edge}_{x1}_{y1}_{x2}_{y2}_ocr.png"
+                        r.annotated.save(out_path)
+                    new_left = min(detected_bbox[0], min(w["x1"] for w in added_words))
+                    new_top = min(detected_bbox[1], min(w["y1"] for w in added_words))
+                    new_right = max(detected_bbox[2], max(w["x2"] for w in added_words))
+                    new_bottom = max(detected_bbox[3], max(w["y2"] for w in added_words))
+                    detected_bbox = (new_left, new_top, new_right, new_bottom)
         if expected_layout:
             expected_layout = _clamp_layout_to_image(expected_layout, image_full.width, image_full.height)
         if detected_bbox and expected_layout:
@@ -552,6 +747,14 @@ def main() -> None:
             crop_bottom = min(image_full.height, crop_bottom)
             if crop_right > crop_left and crop_bottom > crop_top:
                 crop_bbox = (crop_left, crop_top, crop_right, crop_bottom)
+        elif detected_bbox:
+            left, top, right, bottom = detected_bbox
+            left = max(0, left)
+            top = max(0, top)
+            right = min(image_full.width, right)
+            bottom = min(image_full.height, bottom)
+            if right > left and bottom > top:
+                crop_bbox = (left, top, right, bottom)
 
         if crop_bbox:
             image_full = image_full.crop(crop_bbox)
@@ -562,11 +765,26 @@ def main() -> None:
         words = result["words"]
         line_words = result["line_words"]
         image_full = result["image_pil"]
+        expected_layout = None
+        if layout_engine:
+            expected_layout = layout_engine.estimate(
+                line_words,
+                words,
+                target_for_image,
+                window_words=WINDOW_WORDS,
+                max_skip=MAX_SKIP,
+                score_threshold=0.4,
+                boundary_word_index=boundary_word_index,
+            )
+        missing_ratio = None
+        if expected_layout and "target_gaps" in expected_layout:
+            gaps = expected_layout["target_gaps"]
+            missing_len = sum(len(gap) for gap in gaps)
+            denom = max(len(target_for_image), 1)
+            ratio = missing_len / denom
+            missing_ratio = ratio
+            print(f"missing target size: {missing_len} ({ratio:.3f})")
         opt_crop_bbox = None
-
-        pre = preprocess_image(base_image)
-        pre_out = preprocessed_dir / f"{path.stem}_pre.png"
-        pre.save(pre_out)
 
         t_left0 = time.perf_counter()
         t_left1 = t_left0
@@ -575,6 +793,21 @@ def main() -> None:
             draw = ImageDraw.Draw(image)
             for w in words:
                 draw.rectangle([w["x1"], w["y1"], w["x2"], w["y2"]], outline=(0, 200, 0), width=2)
+            models = structure_models if structure_models is not None else build_line_models(line_words)
+            for (p0, p1) in line_segments(models, image.width):
+                draw.line([p0, p1], fill=(0, 120, 255), width=2)
+            if structure_xs is None or structure_ys is None or structure_grid is None:
+                xs, ys, grid = build_mesh(models, image.width, image.height, grid_step=80)
+            else:
+                xs, ys, grid = structure_xs, structure_ys, structure_grid
+            for yi, y in enumerate(ys):
+                points = []
+                for xi, x in enumerate(xs):
+                    dy = grid[yi][xi]
+                    points.append((x, int(round(y - dy))))
+                    draw.line([(x, y), (x, int(round(y - dy)))], fill=(255, 120, 0), width=1)
+                if len(points) > 1:
+                    draw.line(points, fill=(200, 0, 200), width=1)
 
             cluster_result2 = _cluster_bbox(words, return_cluster=True)
             kept_bbox = cluster_result2[0] if cluster_result2 else None
@@ -719,8 +952,8 @@ def main() -> None:
                         opt_crop_bbox = (left, top, right, bottom)
 
             if expected_layout and DRAW_EXPECTED_LAYOUT:
-                offset = (crop_bbox[0], crop_bbox[1]) if crop_bbox else (0, 0)
-                _draw_layout(image, expected_layout, offset)
+                print(f"drawing expected layout: {path.name}")
+                _draw_layout(image, expected_layout, (0, 0))
             out_path = debug_dir / f"{path.stem}_debug.png"
             image.save(out_path)
         t5 = time.perf_counter()
