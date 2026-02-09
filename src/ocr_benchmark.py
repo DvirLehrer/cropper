@@ -28,7 +28,7 @@ from cropper_config import (
 )
 from target_texts import load_target_texts, strip_newlines
 from edge_align_shift import align_edges_shift_side
-from ocr_utils import iter_images, levenshtein, load_types, preprocess_image, text_from_words
+from ocr_utils import iter_images, levenshtein, load_types, preprocess_image
 from line_structure import build_line_models, line_segments, build_pil_mesh
 from line_correction import decide_correction, apply_tilt
 from line_block_mesh import build_block_mesh_from_lines
@@ -123,14 +123,6 @@ def _box_edge_distance(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     elif b["y2"] < a["y1"]:
         dy = a["y1"] - b["y2"]
     return (dx * dx + dy * dy) ** 0.5
-
-
-def _vertical_overlap(a: Dict[str, Any], b: Dict[str, Any]) -> int:
-    return max(0, min(a["y2"], b["y2"]) - max(a["y1"], b["y1"]))
-
-
-def _horizontal_overlap(a: Dict[str, Any], b: Dict[str, Any]) -> int:
-    return max(0, min(a["x2"], b["x2"]) - max(a["x1"], b["x1"]))
 
 
 def _edge_flags(words: List[Dict[str, Any]]) -> Tuple[List[bool], List[bool], List[bool], List[bool]]:
