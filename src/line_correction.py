@@ -103,7 +103,7 @@ def decide_correction(line_words: List[List[Dict[str, Any]]]) -> CorrectionDecis
             resid_std=resid_std,
             curve_std=curve_std,
         )
-    if curve_std >= 0.25 and resid_mean >= 0.13:
+    if curve_std >= 0.2 or resid_mean >= 0.2:
         return CorrectionDecision(
             mode="warp",
             slope=mean,

@@ -62,81 +62,6 @@ def line_segments(
     return segs
 
 
-def build_mesh(
-    models: List[LineModel],
-    width: int,
-    height: int,
-    grid_step: int = 80,
-) -> Tuple[List[int], List[int], List[List[float]]]:
-    if grid_step < 20:
-        grid_step = 20
-    xs = list(range(0, width, grid_step))
-    if xs and xs[-1] != width - 1:
-        xs.append(width - 1)
-    ys = list(range(0, height, grid_step))
-    if ys and ys[-1] != height - 1:
-        ys.append(height - 1)
-    grid: List[List[float]] = []
-    for y in ys:
-        row: List[float] = []
-        for x in xs:
-            samples = [(m.y_at(x), m.y_at(x) - m.y_target) for m in models]
-            samples.sort(key=lambda p: p[0])
-            if not samples:
-                row.append(0.0)
-                continue
-            if y <= samples[0][0]:
-                dy = samples[0][1]
-            elif y >= samples[-1][0]:
-                dy = samples[-1][1]
-            else:
-                dy = 0.0
-                for (y0, d0), (y1, d1) in zip(samples, samples[1:]):
-                    if y0 <= y <= y1:
-                        t = 0.0 if y1 == y0 else (y - y0) / (y1 - y0)
-                        dy = d0 + t * (d1 - d0)
-                        break
-            row.append(dy)
-        grid.append(row)
-    return xs, ys, grid
-
-
-def sample_mesh(
-    xs: List[int],
-    ys: List[int],
-    grid: List[List[float]],
-    x: float,
-    y: float,
-) -> float:
-    if not xs or not ys:
-        return 0.0
-    x = max(xs[0], min(x, xs[-1]))
-    y = max(ys[0], min(y, ys[-1]))
-    ix = max(0, min(len(xs) - 2, _lower_index(xs, x)))
-    iy = max(0, min(len(ys) - 2, _lower_index(ys, y)))
-    x0, x1 = xs[ix], xs[ix + 1]
-    y0, y1 = ys[iy], ys[iy + 1]
-    tx = 0.0 if x1 == x0 else (x - x0) / (x1 - x0)
-    ty = 0.0 if y1 == y0 else (y - y0) / (y1 - y0)
-    d00 = grid[iy][ix]
-    d10 = grid[iy][ix + 1]
-    d01 = grid[iy + 1][ix]
-    d11 = grid[iy + 1][ix + 1]
-    d0 = d00 + tx * (d10 - d00)
-    d1 = d01 + tx * (d11 - d01)
-    return d0 + ty * (d1 - d0)
-
-
-def _lower_index(vals: List[int], v: float) -> int:
-    lo = 0
-    hi = len(vals) - 1
-    while lo + 1 < hi:
-        mid = (lo + hi) // 2
-        if vals[mid] <= v:
-            lo = mid
-        else:
-            hi = mid
-    return lo
 
 
 def build_pil_mesh(
@@ -167,17 +92,3 @@ def build_pil_mesh(
             mesh.append((quad, src))
     return mesh
 
-
-def warp_word_boxes(
-    words: List[Dict[str, Any]],
-    xs: List[int],
-    ys: List[int],
-    grid: List[List[float]],
-) -> None:
-    for w in words:
-        y1 = w["y1"]
-        y2 = w["y2"]
-        dy1 = sample_mesh(xs, ys, grid, w["x1"], y1)
-        dy2 = sample_mesh(xs, ys, grid, w["x2"], y2)
-        w["y1"] = int(round(y1 - dy1))
-        w["y2"] = int(round(y2 - dy2))
