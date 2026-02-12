@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict
 
 import pytesseract
@@ -16,7 +17,11 @@ def _ocr_image_pil(
     lang: str,
     min_boxes_retry: int = 50,
     allow_rotate: bool = True,
+    timing: Dict[str, float] | None = None,
+    timing_prefix: str = "",
 ) -> Dict[str, Any]:
+    t_start = time.perf_counter()
+
     def _run_ocr(
         pil_image: Image.Image,
         *,
@@ -59,6 +64,9 @@ def _ocr_image_pil(
         if len(boosted["words"]) > len(result["words"]):
             result = boosted
 
+    if timing is not None:
+        timing[f"{timing_prefix}ocr_p4_total"] = time.perf_counter() - t_start
+
     result["image"] = "in-memory"
     result["image_pil"] = used_image
     return result
@@ -67,15 +75,27 @@ def _ocr_image_pil(
 def _ocr_image_pil_sparse_merge(
     image: Image.Image,
     lang: str,
+    timing: Dict[str, float] | None = None,
+    timing_prefix: str = "",
 ) -> Dict[str, Any]:
-    base = _ocr_image_pil(image, lang=lang, allow_rotate=False)
+    t_start = time.perf_counter()
+    base = _ocr_image_pil(
+        image,
+        lang=lang,
+        allow_rotate=False,
+        timing=timing,
+        timing_prefix=f"{timing_prefix}sparse_base_",
+    )
     pre = base["preprocessed"]
+    t_psm11 = time.perf_counter()
     data = pytesseract.image_to_data(
         pre,
         lang=lang,
         config="--psm 11",
         output_type=pytesseract.Output.DICT,
     )
+    if timing is not None:
+        timing[f"{timing_prefix}sparse_psm11"] = time.perf_counter() - t_psm11
     from ocr_utils import word_boxes_from_data, text_from_words
 
     sparse_words = word_boxes_from_data(data)
@@ -108,4 +128,6 @@ def _ocr_image_pil_sparse_merge(
             "line_words": line_words,
         }
     )
+    if timing is not None:
+        timing[f"{timing_prefix}sparse_total"] = time.perf_counter() - t_start
     return base

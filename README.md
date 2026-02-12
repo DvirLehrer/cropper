@@ -13,6 +13,7 @@ Quick Start
   - Push repo to GitHub
   - In Render, create a new Blueprint service from this repo (uses `render.yaml`)
   - Render will build using `Dockerfile` and run Gunicorn automatically
+  - For faster OCR in cloud, prefer a higher CPU instance type (OCR is CPU-bound)
 - Output folders (generated):
   - `ocr_text/` : per-image OCR text
   - `debug_images/` : debug overlays (overall bbox, word boxes, line boxes, edge lines)

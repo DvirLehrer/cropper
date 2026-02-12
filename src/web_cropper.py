@@ -25,6 +25,7 @@ def crop_uploaded_image_bytes(
     result["cropped"].save(out, format="JPEG", quality=95, optimize=True)
     metadata = {
         "timing": result["timing"],
+        "timing_detail": result.get("timing_detail", {}),
         "correction_mode": result["correction"].mode,
         "crop_area": result["crop_area"],
         "px_per_char": result["px_per_char"],

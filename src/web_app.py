@@ -51,7 +51,7 @@ INDEX_HTML = """<!doctype html>
         <a id="downloadBtn" href="#" download="cropped.png" style="display:none;">הורדת התמונה החתוכה</a>
       </div>
       <p id="status"></p>
-      <pre id="logBox" style="display:none; background:#f3f3ea; border:1px solid #d7d7cc; border-radius:10px; padding:0.8rem; overflow:auto;"></pre>
+      <pre id="timingBox" style="display:block; background:#f3f3ea; border:1px solid #d7d7cc; border-radius:10px; padding:0.8rem; overflow:auto; white-space:pre-wrap;"></pre>
       <div class="preview-grid">
         <div>
           <h3>תמונה מקורית</h3>
@@ -68,10 +68,10 @@ INDEX_HTML = """<!doctype html>
     const fileInput = document.getElementById("fileInput");
     const cropBtn = document.getElementById("cropBtn");
     const statusEl = document.getElementById("status");
+    const timingBox = document.getElementById("timingBox");
     const originalEl = document.getElementById("original");
     const croppedEl = document.getElementById("cropped");
     const downloadBtn = document.getElementById("downloadBtn");
-    const logBox = document.getElementById("logBox");
 
     cropBtn.addEventListener("click", async () => {
       const file = fileInput.files[0];
@@ -85,9 +85,8 @@ INDEX_HTML = """<!doctype html>
       originalEl.style.display = "block";
       croppedEl.style.display = "none";
       downloadBtn.style.display = "none";
-      logBox.style.display = "none";
-      logBox.textContent = "";
-      statusEl.textContent = "מעבד...";
+      timingBox.textContent = "";
+      statusEl.textContent = "Processing...";
       cropBtn.disabled = true;
       try {
         const formData = new FormData();
@@ -107,8 +106,12 @@ INDEX_HTML = """<!doctype html>
         }
         const startData = await startRes.json();
         const jobId = startData.job_id;
-        logBox.style.display = "block";
-        logBox.textContent = "";
+        timingBox.textContent += "started\\n";
+        let elapsedTotal = null;
+        let prevStepSec = null;
+        let prevStepLabel = null;
+        const MIN_SPAN_SEC = 0.01;
+        const HIDDEN_SPAN_LABELS = new Set(["job_queued", "job_started"]);
 
         const es = new EventSource(`/api/jobs/${jobId}/events`);
         await new Promise((resolve, reject) => {
@@ -116,8 +119,24 @@ INDEX_HTML = """<!doctype html>
             try {
               const payload = JSON.parse(ev.data);
               if (payload.type === "log" && payload.message) {
-                logBox.textContent += payload.message + "\\n";
-                logBox.scrollTop = logBox.scrollHeight;
+                timingBox.textContent += payload.message + "\\n";
+                const m = payload.message.match(/^\\[\\+(\\d+(?:\\.\\d+)?)s\\]/);
+                if (m) {
+                  const sec = Number(m[1]);
+                  if (Number.isFinite(sec)) {
+                    elapsedTotal = sec;
+                    const label = payload.message.replace(/^\\[\\+\\d+(?:\\.\\d+)?s\\]\\s*/, "");
+                    if (prevStepSec !== null && prevStepLabel) {
+                      const span = sec - prevStepSec;
+                      if (span >= MIN_SPAN_SEC && !HIDDEN_SPAN_LABELS.has(prevStepLabel)) {
+                        timingBox.textContent += `span ${prevStepLabel} ${span.toFixed(3)}s\\n`;
+                      }
+                    }
+                    prevStepSec = sec;
+                    prevStepLabel = label;
+                  }
+                }
+                timingBox.scrollTop = timingBox.scrollHeight;
               }
               if (payload.type === "done") {
                 es.close();
@@ -160,42 +179,13 @@ INDEX_HTML = """<!doctype html>
         downloadBtn.href = croppedUrl;
         downloadBtn.download = downloadName;
         downloadBtn.style.display = "inline-block";
-        const logLines = [];
-        const correctionMode = res.headers.get("X-Correction-Mode");
-        const cropArea = res.headers.get("X-Crop-Area");
-        const pxPerChar = res.headers.get("X-Px-Per-Char");
-        const outputSize = res.headers.get("X-Output-Size");
-        if (correctionMode) logLines.push(`מצב תיקון: ${correctionMode}`);
-        if (outputSize) logLines.push(`גודל פלט: ${outputSize}`);
-        if (cropArea) logLines.push(`שטח חיתוך: ${cropArea}`);
-        if (pxPerChar) logLines.push(`פיקסלים לתו: ${Number(pxPerChar).toFixed(1)}`);
-        const timingKeys = [
-          ["X-Timing-OCR1", "ocr1"],
-          ["X-Timing-Layout", "layout"],
-          ["X-Timing-Crop", "crop"],
-          ["X-Timing-OCR2", "ocr2"],
-          ["X-Timing-Debug", "debug"]
-        ];
-        let timingSum = 0;
-        for (const [headerName, label] of timingKeys) {
-          const raw = res.headers.get(headerName);
-          if (!raw) continue;
-          const v = Number(raw);
-          if (Number.isFinite(v)) {
-            timingSum += v;
-            logLines.push(`זמן ${label}: ${v.toFixed(3)}s`);
-          }
+        if (elapsedTotal !== null) {
+          timingBox.textContent += `elapsed_total ${elapsedTotal.toFixed(3)}s\\n`;
         }
-        if (timingSum > 0) {
-          logLines.push(`סה"כ: ${timingSum.toFixed(3)}s`);
-        }
-        if (logLines.length > 0) {
-          logBox.textContent = logLines.join("\\n");
-          logBox.style.display = "block";
-        }
-        statusEl.textContent = "הסתיים.";
+        statusEl.textContent = "Done.";
       } catch (err) {
-        statusEl.textContent = "שגיאה: " + err.message;
+        statusEl.textContent = "Error: " + err.message;
+        timingBox.textContent += `error ${err.message}\\n`;
       } finally {
         cropBtn.disabled = false;
       }
@@ -225,7 +215,7 @@ def crop_api():
     with JOBS_LOCK:
         JOBS[job_id] = {
             "status": "queued",
-            "logs": [],
+            "logs": ["[+0.000s] job_queued"],
             "result": None,
             "mime_type": None,
             "meta": None,
@@ -233,15 +223,21 @@ def crop_api():
         }
 
     def worker() -> None:
+        t0 = time.perf_counter()
+
+        def elapsed_prefix() -> str:
+            return f"[+{(time.perf_counter() - t0):.3f}s]"
+
         def progress(message: str) -> None:
             with JOBS_LOCK:
                 job = JOBS.get(job_id)
                 if job is not None:
-                    job["logs"].append(message)
+                    job["logs"].append(f"{elapsed_prefix()} {message}")
 
         with JOBS_LOCK:
             if job_id in JOBS:
                 JOBS[job_id]["status"] = "running"
+                JOBS[job_id]["logs"].append(f"{elapsed_prefix()} job_started")
         try:
             cropped_bytes, mime_type, meta = crop_uploaded_image_bytes(raw, progress_cb=progress)
             with JOBS_LOCK:
@@ -251,13 +247,14 @@ def crop_api():
                     job["result"] = cropped_bytes
                     job["mime_type"] = mime_type
                     job["meta"] = meta
+                    job["logs"].append(f"{elapsed_prefix()} job_finished")
         except Exception as exc:
             with JOBS_LOCK:
                 job = JOBS.get(job_id)
                 if job is not None:
                     job["status"] = "error"
                     job["error"] = str(exc)
-                    job["logs"].append(f"ERROR: {exc}")
+                    job["logs"].append(f"{elapsed_prefix()} error {exc}")
 
     threading.Thread(target=worker, daemon=True).start()
     return jsonify({"job_id": job_id})
@@ -313,6 +310,7 @@ def crop_job_result(job_id: str):
     )
     meta = job.get("meta") or {}
     timing = meta.get("timing", {})
+    timing_detail = meta.get("timing_detail", {})
     response.headers["X-Correction-Mode"] = str(meta.get("correction_mode", ""))
     response.headers["X-Crop-Area"] = str(meta.get("crop_area", ""))
     response.headers["X-Px-Per-Char"] = f"{float(meta.get('px_per_char', 0.0)):.6f}"
@@ -323,6 +321,9 @@ def crop_job_result(job_id: str):
     response.headers["X-Timing-Crop"] = f"{float(timing.get('crop', 0.0)):.6f}"
     response.headers["X-Timing-OCR2"] = f"{float(timing.get('ocr2', 0.0)):.6f}"
     response.headers["X-Timing-Debug"] = f"{float(timing.get('debug', 0.0)):.6f}"
+    for key, value in timing_detail.items():
+        header_key = "X-Timing-Detail-" + str(key).replace("_", "-")
+        response.headers[header_key] = f"{float(value):.6f}"
     return response
 
 

@@ -2,7 +2,12 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    OMP_THREAD_LIMIT=1 \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1
 
 WORKDIR /app
 
@@ -21,4 +26,4 @@ COPY text_type.csv ./text_type.csv
 ENV PORT=8000
 EXPOSE 8000
 
-CMD ["sh", "-c", "gunicorn --chdir src --workers 1 --timeout 240 --graceful-timeout 30 --bind 0.0.0.0:${PORT} web_app:app"]
+CMD ["sh", "-c", "gunicorn --chdir src --workers 1 --worker-tmp-dir /dev/shm --timeout 240 --graceful-timeout 30 --bind 0.0.0.0:${PORT} web_app:app"]

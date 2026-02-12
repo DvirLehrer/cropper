@@ -36,6 +36,7 @@ def _apply_layout_correction(
     line_words: list[list[dict[str, Any]]],
     *,
     lang: str,
+    timing_detail: Dict[str, float],
 ) -> tuple[Image.Image, list[dict[str, Any]], list[list[dict[str, Any]]], bool]:
     correction = decide_correction(line_words)
     changed = False
@@ -47,8 +48,15 @@ def _apply_layout_correction(
             original_image = image_full
             original_words = words
             original_line_words = line_words
+            t_transform = time.perf_counter()
             image_full = image_full.transform(image_full.size, Image.MESH, mesh, resample=Image.BICUBIC)
-            warp_result = _ocr_image_pil_sparse_merge(image_full, lang=lang)
+            timing_detail["crop_warp_transform"] = time.perf_counter() - t_transform
+            warp_result = _ocr_image_pil_sparse_merge(
+                image_full,
+                lang=lang,
+                timing=timing_detail,
+                timing_prefix="crop_warp_",
+            )
             words = warp_result["words"]
             line_words = warp_result["line_words"]
             post = decide_correction(line_words)
@@ -59,8 +67,15 @@ def _apply_layout_correction(
             else:
                 changed = True
     elif ENABLE_LINE_WARP and APPLY_LINE_CORRECTION and correction.mode == "tilt":
+        t_tilt = time.perf_counter()
         image_full = apply_tilt(image_full, words, correction.slope)
-        tilt_result = _ocr_image_pil_sparse_merge(image_full, lang=lang)
+        timing_detail["crop_tilt_transform"] = time.perf_counter() - t_tilt
+        tilt_result = _ocr_image_pil_sparse_merge(
+            image_full,
+            lang=lang,
+            timing=timing_detail,
+            timing_prefix="crop_tilt_",
+        )
         words = tilt_result["words"]
         line_words = tilt_result["line_words"]
         changed = True
@@ -114,15 +129,27 @@ def crop_image(
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     _log(progress_cb, "Starting OCR pipeline")
+    timing_detail: Dict[str, float] = {}
     t0 = time.perf_counter()
-    result = _ocr_image_pil(image_full, lang=lang)
+    result = _ocr_image_pil(
+        image_full,
+        lang=lang,
+        timing=timing_detail,
+        timing_prefix="stage1_",
+    )
     image_full = result["image_pil"]
     if len(result["words"]) < 50:
         pre_for_stripe = preprocess_image(image_full, upscale_factor=1.0, sharpen=False)
         stripe_bbox = _stripe_roi_bbox(pre_for_stripe)
         if stripe_bbox:
             image_full = image_full.crop(stripe_bbox)
-            result = _ocr_image_pil(image_full, lang=lang, allow_rotate=False)
+            result = _ocr_image_pil(
+                image_full,
+                lang=lang,
+                allow_rotate=False,
+                timing=timing_detail,
+                timing_prefix="stage1_retry_",
+            )
             image_full = result["image_pil"]
             _log(progress_cb, "Applied stripe ROI retry")
     t1 = time.perf_counter()
@@ -139,6 +166,7 @@ def crop_image(
         words,
         line_words,
         lang=lang,
+        timing_detail=timing_detail,
     )
     if corrected_changed:
         _log(progress_cb, "Applied tilt/warp correction")
@@ -148,7 +176,12 @@ def crop_image(
     t3 = time.perf_counter()
 
     if corrected_changed or initial_crop_changed:
-        result = _ocr_image_pil(image_full, lang=lang)
+        result = _ocr_image_pil(
+            image_full,
+            lang=lang,
+            timing=timing_detail,
+            timing_prefix="stage2_",
+        )
         words = result["words"]
         line_words = result["line_words"]
         image_full = result["image_pil"]
@@ -160,7 +193,9 @@ def crop_image(
     cluster_words = cluster_result2[1] if cluster_result2 else []
     opt_crop_bbox = None
     if cluster_words:
+        t_edge = time.perf_counter()
         opt_crop_bbox = compute_opt_crop_bbox(cluster_words, line_words, image_full.width, image_full.height)
+        timing_detail["crop_edge_align"] = time.perf_counter() - t_edge
         if opt_crop_bbox:
             _log(progress_cb, "Computed final edge-aligned crop")
 
@@ -191,4 +226,5 @@ def crop_image(
             "debug": t5 - t4,
             "left": 0.0,
         },
+        "timing_detail": timing_detail,
     }
