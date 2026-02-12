@@ -41,8 +41,9 @@ RUN git clone --branch "${TESSERACT_VERSION}" --depth 1 https://github.com/tesse
 RUN mkdir -p /usr/local/share/tessdata \
     && wget -O /usr/local/share/tessdata/heb.traineddata \
     https://github.com/tesseract-ocr/tessdata_best/raw/main/heb.traineddata
+RUN ln -sf /usr/local/share/tessdata/heb.traineddata /usr/local/share/heb.traineddata
 
-ENV TESSDATA_PREFIX=/usr/local/share/
+ENV TESSDATA_PREFIX=/usr/local/share/tessdata/
 RUN tesseract --version
 
 COPY requirements.txt ./

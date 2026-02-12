@@ -336,13 +336,17 @@ def crop_job_result(job_id: str):
 @app.get("/api/runtime")
 def runtime_info():
     tessdata_prefix = os.environ.get("TESSDATA_PREFIX", "")
-    heb_path = pathlib.Path(tessdata_prefix) / "tessdata" / "heb.traineddata" if tessdata_prefix else pathlib.Path()
+    heb_path = pathlib.Path(tessdata_prefix) / "tessdata" / "heb.traineddata" if tessdata_prefix else None
     heb_sha256 = None
     heb_size = None
-    if heb_path and heb_path.exists():
-        data = heb_path.read_bytes()
-        heb_sha256 = hashlib.sha256(data).hexdigest()
-        heb_size = len(data)
+    if heb_path is not None and heb_path.exists() and heb_path.is_file():
+        try:
+            data = heb_path.read_bytes()
+            heb_sha256 = hashlib.sha256(data).hexdigest()
+            heb_size = len(data)
+        except Exception:
+            heb_sha256 = None
+            heb_size = None
     try:
         version_out = subprocess.check_output(["tesseract", "--version"], text=True)
         tesseract_version = version_out.splitlines()[0].strip() if version_out else ""
@@ -355,7 +359,7 @@ def runtime_info():
             "pytesseract": pytesseract.__version__,
             "tesseract": tesseract_version,
             "tessdata_prefix": tessdata_prefix,
-            "heb_traineddata_path": str(heb_path) if heb_path else "",
+            "heb_traineddata_path": str(heb_path) if heb_path is not None else "",
             "heb_traineddata_size": heb_size,
             "heb_traineddata_sha256": heb_sha256,
         }

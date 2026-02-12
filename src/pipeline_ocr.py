@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Dict
 
@@ -10,6 +11,11 @@ import pytesseract
 from PIL import Image
 
 from ocr_utils import preprocess_image
+
+
+def _tesseract_config(psm: int) -> str:
+    tessdata_dir = os.environ.get("TESSDATA_PREFIX", "/usr/local/share/tessdata/")
+    return f'--psm {psm} --tessdata-dir "{tessdata_dir}"'
 
 
 def _ocr_image_pil(
@@ -32,7 +38,7 @@ def _ocr_image_pil(
         data = pytesseract.image_to_data(
             pre,
             lang=lang,
-            config="--psm 4",
+            config=_tesseract_config(4),
             output_type=pytesseract.Output.DICT,
         )
         from ocr_utils import word_boxes_from_data, text_from_words
@@ -91,7 +97,7 @@ def _ocr_image_pil_sparse_merge(
     data = pytesseract.image_to_data(
         pre,
         lang=lang,
-        config="--psm 11",
+        config=_tesseract_config(11),
         output_type=pytesseract.Output.DICT,
     )
     if timing is not None:
