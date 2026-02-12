@@ -10,7 +10,7 @@ import time
 import uuid
 from io import BytesIO
 
-from flask import Response, jsonify, render_template_string, request, send_file, stream_with_context
+from flask import Flask, Response, jsonify, render_template_string, request, send_file, stream_with_context
 
 from web_cropper import crop_uploaded_image_bytes
 
