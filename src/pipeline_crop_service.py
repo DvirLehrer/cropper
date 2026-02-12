@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFilter
 
@@ -23,6 +23,11 @@ ENABLE_LINE_WARP = True
 APPLY_LINE_CORRECTION = True
 APPLY_CROP_DENOISE = True
 CROP_DENOISE_SIZE = 3
+
+
+def _log(progress_cb: Optional[Callable[[str], None]], message: str) -> None:
+    if progress_cb:
+        progress_cb(message)
 
 
 def _apply_layout_correction(
@@ -106,7 +111,9 @@ def crop_image(
     lang: str = LANG,
     target_chars: Optional[int] = None,
     debug_path: Optional[Path] = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
+    _log(progress_cb, "Starting OCR pipeline")
     t0 = time.perf_counter()
     result = _ocr_image_pil(image_full, lang=lang)
     image_full = result["image_pil"]
@@ -117,12 +124,15 @@ def crop_image(
             image_full = image_full.crop(stripe_bbox)
             result = _ocr_image_pil(image_full, lang=lang, allow_rotate=False)
             image_full = result["image_pil"]
+            _log(progress_cb, "Applied stripe ROI retry")
     t1 = time.perf_counter()
+    _log(progress_cb, f"First OCR complete ({len(result['words'])} words)")
 
     words = result["words"]
     line_words = result["line_words"]
     correction = decide_correction(line_words)
     t2 = time.perf_counter()
+    _log(progress_cb, f"Layout mode: {correction.mode}")
 
     image_full, words, line_words, corrected_changed = _apply_layout_correction(
         image_full,
@@ -130,7 +140,11 @@ def crop_image(
         line_words,
         lang=lang,
     )
+    if corrected_changed:
+        _log(progress_cb, "Applied tilt/warp correction")
     image_full, initial_crop_changed = _apply_initial_cluster_crop(image_full, words)
+    if initial_crop_changed:
+        _log(progress_cb, "Applied initial cluster crop")
     t3 = time.perf_counter()
 
     if corrected_changed or initial_crop_changed:
@@ -138,6 +152,7 @@ def crop_image(
         words = result["words"]
         line_words = result["line_words"]
         image_full = result["image_pil"]
+        _log(progress_cb, f"Second OCR complete ({len(words)} words)")
     t4 = time.perf_counter()
 
     ocr_text = strip_newlines(result["text"])
@@ -146,6 +161,8 @@ def crop_image(
     opt_crop_bbox = None
     if cluster_words:
         opt_crop_bbox = compute_opt_crop_bbox(cluster_words, line_words, image_full.width, image_full.height)
+        if opt_crop_bbox:
+            _log(progress_cb, "Computed final edge-aligned crop")
 
     if debug_path:
         _write_debug_overlay(debug_path, image_full, words)
@@ -157,6 +174,7 @@ def crop_image(
         target_chars=target_chars,
         ocr_text=ocr_text,
     )
+    _log(progress_cb, f"Done ({cropped.width}x{cropped.height})")
 
     return {
         "cropped": cropped,

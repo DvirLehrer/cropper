@@ -4,18 +4,33 @@
 from __future__ import annotations
 
 from io import BytesIO
+from typing import Callable, Optional
 
 from PIL import Image
 
 from pipeline_crop_service import crop_image
 
 
-def crop_uploaded_image_bytes(image_bytes: bytes) -> tuple[bytes, str]:
-    """Crop uploaded image bytes and return (JPEG bytes, mime type)."""
+def crop_uploaded_image_bytes(
+    image_bytes: bytes,
+    *,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> tuple[bytes, str, dict]:
+    """Crop uploaded image bytes and return (JPEG bytes, mime type, metadata)."""
     with Image.open(BytesIO(image_bytes)) as opened:
         image = opened.convert("RGB")
 
-    result = crop_image(image)
+    result = crop_image(image, progress_cb=progress_cb)
     out = BytesIO()
     result["cropped"].save(out, format="JPEG", quality=95, optimize=True)
-    return out.getvalue(), "image/jpeg"
+    metadata = {
+        "timing": result["timing"],
+        "correction_mode": result["correction"].mode,
+        "crop_area": result["crop_area"],
+        "px_per_char": result["px_per_char"],
+        "size": {
+            "width": result["cropped"].width,
+            "height": result["cropped"].height,
+        },
+    }
+    return out.getvalue(), "image/jpeg", metadata
