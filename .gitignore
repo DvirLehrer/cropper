@@ -1,3 +1,5 @@
+benchmark/
+cropped/
 debug_images/
 preprocessed/
 ocr_text/

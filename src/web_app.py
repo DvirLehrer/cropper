@@ -84,8 +84,18 @@ INDEX_HTML = """<!doctype html>
         formData.append("image", file);
         const res = await fetch("/api/crop", { method: "POST", body: formData });
         if (!res.ok) {
-          const data = await res.json();
-          throw new Error(data.error || "Crop failed");
+          const contentType = res.headers.get("content-type") || "";
+          let message = `שגיאת שרת (${res.status})`;
+          if (contentType.includes("application/json")) {
+            const data = await res.json();
+            message = data.error || message;
+          } else {
+            const bodyText = await res.text();
+            if (bodyText) {
+              message = `${message}: ${bodyText.slice(0, 120)}`;
+            }
+          }
+          throw new Error(message);
         }
         const blob = await res.blob();
         const croppedUrl = URL.createObjectURL(blob);

@@ -5,14 +5,14 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFilter
 
 from cropper_config import LANG
 from line_block_mesh import build_block_mesh_from_lines
 from line_correction import apply_tilt, decide_correction
-from line_structure import build_line_models, build_pil_mesh
+from line_structure import build_pil_mesh
 from ocr_utils import preprocess_image
 from pipeline_align import compute_opt_crop_bbox
 from pipeline_geometry import _clamp_bbox, _cluster_bbox, _stripe_roi_bbox
@@ -23,6 +23,81 @@ ENABLE_LINE_WARP = True
 APPLY_LINE_CORRECTION = True
 APPLY_CROP_DENOISE = True
 CROP_DENOISE_SIZE = 3
+
+
+def _apply_layout_correction(
+    image_full: Image.Image,
+    words: list[dict[str, Any]],
+    line_words: list[list[dict[str, Any]]],
+    *,
+    lang: str,
+) -> tuple[Image.Image, list[dict[str, Any]], list[list[dict[str, Any]]], bool]:
+    correction = decide_correction(line_words)
+    changed = False
+
+    if ENABLE_LINE_WARP and APPLY_LINE_CORRECTION and correction.mode == "warp":
+        xs, ys, grid = build_block_mesh_from_lines(line_words, image_full.width, image_full.height, grid_step=80)
+        mesh = build_pil_mesh(xs, ys, grid)
+        if mesh:
+            original_image = image_full
+            original_words = words
+            original_line_words = line_words
+            image_full = image_full.transform(image_full.size, Image.MESH, mesh, resample=Image.BICUBIC)
+            warp_result = _ocr_image_pil_sparse_merge(image_full, lang=lang)
+            words = warp_result["words"]
+            line_words = warp_result["line_words"]
+            post = decide_correction(line_words)
+            if post.curve_std > correction.curve_std * 1.05 or post.resid_mean > correction.resid_mean * 1.05:
+                image_full = original_image
+                words = original_words
+                line_words = original_line_words
+            else:
+                changed = True
+    elif ENABLE_LINE_WARP and APPLY_LINE_CORRECTION and correction.mode == "tilt":
+        image_full = apply_tilt(image_full, words, correction.slope)
+        tilt_result = _ocr_image_pil_sparse_merge(image_full, lang=lang)
+        words = tilt_result["words"]
+        line_words = tilt_result["line_words"]
+        changed = True
+
+    return image_full, words, line_words, changed
+
+
+def _apply_initial_cluster_crop(
+    image_full: Image.Image,
+    words: list[dict[str, Any]],
+) -> tuple[Image.Image, bool]:
+    cluster_result = _cluster_bbox(words, return_cluster=True)
+    if not cluster_result:
+        return image_full, False
+    crop_bbox = _clamp_bbox(cluster_result[0], image_full.width, image_full.height)
+    if not crop_bbox:
+        return image_full, False
+    return image_full.crop(crop_bbox), True
+
+
+def _write_debug_overlay(debug_path: Path, image_full: Image.Image, words: list[dict[str, Any]]) -> None:
+    debug_image = image_full.copy()
+    draw = ImageDraw.Draw(debug_image)
+    for w in words:
+        draw.rectangle([w["x1"], w["y1"], w["x2"], w["y2"]], outline=(0, 200, 0), width=2)
+    debug_image.save(debug_path)
+
+
+def _finalize_crop(
+    image_full: Image.Image,
+    opt_crop_bbox: Optional[Tuple[int, int, int, int]],
+    *,
+    target_chars: Optional[int],
+    ocr_text: str,
+) -> tuple[Image.Image, int, float]:
+    cropped = image_full.crop(opt_crop_bbox) if opt_crop_bbox else image_full
+    effective_target_chars = target_chars if target_chars is not None else max(len(ocr_text), 1)
+    crop_area = cropped.width * cropped.height
+    px_per_char = crop_area / max(effective_target_chars, 1)
+    if APPLY_CROP_DENOISE and CROP_DENOISE_SIZE > 1 and px_per_char > 1000:
+        cropped = cropped.filter(ImageFilter.MedianFilter(size=CROP_DENOISE_SIZE))
+    return cropped, crop_area, px_per_char
 
 
 def crop_image(
@@ -49,63 +124,39 @@ def crop_image(
     correction = decide_correction(line_words)
     t2 = time.perf_counter()
 
-    if ENABLE_LINE_WARP and APPLY_LINE_CORRECTION and correction.mode == "warp":
-        models = build_line_models(line_words)
-        xs, ys, grid = build_block_mesh_from_lines(line_words, image_full.width, image_full.height, grid_step=80)
-        mesh = build_pil_mesh(xs, ys, grid)
-        if mesh:
-            original_image = image_full
-            original_words = [dict(w) for w in words]
-            original_line_words = [list(line) for line in line_words]
-            image_full = image_full.transform(image_full.size, Image.MESH, mesh, resample=Image.BICUBIC)
-            warp_result = _ocr_image_pil_sparse_merge(image_full, lang=lang)
-            words = warp_result["words"]
-            line_words = warp_result["line_words"]
-            post = decide_correction(line_words)
-            if post.curve_std > correction.curve_std * 1.05 or post.resid_mean > correction.resid_mean * 1.05:
-                image_full = original_image
-                words = original_words
-                line_words = original_line_words
-    elif ENABLE_LINE_WARP and APPLY_LINE_CORRECTION and correction.mode == "tilt":
-        image_full = apply_tilt(image_full, words, correction.slope)
-        tilt_result = _ocr_image_pil_sparse_merge(image_full, lang=lang)
-        words = tilt_result["words"]
-        line_words = tilt_result["line_words"]
-
-    cluster_result = _cluster_bbox(words, return_cluster=True)
-    if cluster_result:
-        crop_bbox = _clamp_bbox(cluster_result[0], image_full.width, image_full.height)
-        if crop_bbox:
-            image_full = image_full.crop(crop_bbox)
+    image_full, words, line_words, corrected_changed = _apply_layout_correction(
+        image_full,
+        words,
+        line_words,
+        lang=lang,
+    )
+    image_full, initial_crop_changed = _apply_initial_cluster_crop(image_full, words)
     t3 = time.perf_counter()
 
-    result = _ocr_image_pil(image_full, lang=lang)
+    if corrected_changed or initial_crop_changed:
+        result = _ocr_image_pil(image_full, lang=lang)
+        words = result["words"]
+        line_words = result["line_words"]
+        image_full = result["image_pil"]
     t4 = time.perf_counter()
-    words = result["words"]
-    line_words = result["line_words"]
-    image_full = result["image_pil"]
-    ocr_text = strip_newlines(result["text"])
 
-    opt_crop_bbox = None
+    ocr_text = strip_newlines(result["text"])
     cluster_result2 = _cluster_bbox(words, return_cluster=True)
     cluster_words = cluster_result2[1] if cluster_result2 else []
+    opt_crop_bbox = None
     if cluster_words:
         opt_crop_bbox = compute_opt_crop_bbox(cluster_words, line_words, image_full.width, image_full.height)
 
     if debug_path:
-        debug_image = image_full.copy()
-        draw = ImageDraw.Draw(debug_image)
-        for w in words:
-            draw.rectangle([w["x1"], w["y1"], w["x2"], w["y2"]], outline=(0, 200, 0), width=2)
-        debug_image.save(debug_path)
+        _write_debug_overlay(debug_path, image_full, words)
     t5 = time.perf_counter()
 
-    cropped = image_full.crop(opt_crop_bbox) if opt_crop_bbox else image_full
-    effective_target_chars = target_chars if target_chars is not None else max(len(ocr_text), 1)
-    crop_area = cropped.width * cropped.height
-    px_per_char = crop_area / max(effective_target_chars, 1)
-    if APPLY_CROP_DENOISE and CROP_DENOISE_SIZE > 1 and px_per_char > 1000:
-        cropped = cropped.filter(ImageFilter.MedianFilter(size=CROP_DENOISE_SIZE))
+    cropped, crop_area, px_per_char = _finalize_crop(
+        image_full,
+        opt_crop_bbox,
+        target_chars=target_chars,
+        ocr_text=ocr_text,
+    )
 
     return {
         "cropped": cropped,
