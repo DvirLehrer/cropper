@@ -4,7 +4,15 @@ This repo contains OCR benchmarking scripts and image assets for mezuzah scans.
 
 Quick Start
 - Run OCR benchmark on all images:
-  - `python3 src/ocr_benchmark.py`
+  - `python3 src/cropper_pipeline.py`
+- Run web app for manual upload/crop testing:
+  - `pip install -r requirements.txt`
+  - `python3 src/web_app.py`
+  - open `http://localhost:8000`
+- Deploy (Render):
+  - Push repo to GitHub
+  - In Render, create a new Blueprint service from this repo (uses `render.yaml`)
+  - Render will build using `Dockerfile` and run Gunicorn automatically
 - Output folders (generated):
   - `ocr_text/` : per-image OCR text
   - `debug_images/` : debug overlays (overall bbox, word boxes, line boxes, edge lines)
@@ -13,7 +21,7 @@ Quick Start
 Repository Structure
 - `benchmark/` : input images
 - `text/` : canonical Hebrew texts (shema, vehaya, kadesh, peter)
-- `src/ocr_benchmark.py` : main benchmark runner
+- `src/cropper_pipeline.py` : main benchmark runner
 - `src/ocr_utils.py` : shared OCR helpers (preprocess, OCR, line clustering, Levenshtein)
 - `src/edge_align_shift.py` : edge alignment sweep for crop boundaries
 - `src/line_*` : line structure, correction, and block mesh utilities
@@ -47,7 +55,7 @@ Target Texts
 - Tefillin uses four texts: Shema, Vehaya, Kadesh, Peter (per `text/` files).
 
 Configurable Parameters
-Defined at the top of `src/ocr_benchmark.py`:
+Defined at the top of `src/cropper_pipeline.py`:
 - `APPLY_CROP_DENOISE` : toggle median-filter denoise on saved crops
 - `CROP_DENOISE_SIZE` : median filter kernel size
 - `ENABLE_LINE_WARP` : toggle non-linear line warp correction

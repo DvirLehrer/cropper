@@ -1,0 +1,12 @@
+.git
+.gitignore
+.DS_Store
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+benchmark
+cropped
+debug_images
+ocr_text
+preprocessed
