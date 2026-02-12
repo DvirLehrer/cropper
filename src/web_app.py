@@ -5,12 +5,18 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
+import pathlib
+import platform
+import subprocess
 import threading
 import time
 import uuid
 from io import BytesIO
 
 from flask import Flask, Response, jsonify, render_template_string, request, send_file, stream_with_context
+import PIL
+import pytesseract
 
 from web_cropper import crop_uploaded_image_bytes
 
@@ -325,6 +331,35 @@ def crop_job_result(job_id: str):
         header_key = "X-Timing-Detail-" + str(key).replace("_", "-")
         response.headers[header_key] = f"{float(value):.6f}"
     return response
+
+
+@app.get("/api/runtime")
+def runtime_info():
+    tessdata_prefix = os.environ.get("TESSDATA_PREFIX", "")
+    heb_path = pathlib.Path(tessdata_prefix) / "tessdata" / "heb.traineddata" if tessdata_prefix else pathlib.Path()
+    heb_sha256 = None
+    heb_size = None
+    if heb_path and heb_path.exists():
+        data = heb_path.read_bytes()
+        heb_sha256 = hashlib.sha256(data).hexdigest()
+        heb_size = len(data)
+    try:
+        version_out = subprocess.check_output(["tesseract", "--version"], text=True)
+        tesseract_version = version_out.splitlines()[0].strip() if version_out else ""
+    except Exception as exc:
+        tesseract_version = f"error: {exc}"
+    return jsonify(
+        {
+            "python": platform.python_version(),
+            "pillow": PIL.__version__,
+            "pytesseract": pytesseract.__version__,
+            "tesseract": tesseract_version,
+            "tessdata_prefix": tessdata_prefix,
+            "heb_traineddata_path": str(heb_path) if heb_path else "",
+            "heb_traineddata_size": heb_size,
+            "heb_traineddata_sha256": heb_sha256,
+        }
+    )
 
 
 if __name__ == "__main__":
