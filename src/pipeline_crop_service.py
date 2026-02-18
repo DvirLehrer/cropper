@@ -17,6 +17,7 @@ from ocr_utils import preprocess_image
 from pipeline_align import compute_opt_crop_bbox
 from pipeline_geometry import _clamp_bbox, _cluster_bbox, _stripe_roi_bbox
 from pipeline_ocr import _ocr_image_pil, _ocr_image_pil_sparse_merge
+from magnet_mask import suppress_margin_magnets
 from target_texts import strip_newlines
 
 ENABLE_LINE_WARP = True
@@ -154,6 +155,19 @@ def crop_image(
             _log(progress_cb, "Applied stripe ROI retry")
     t1 = time.perf_counter()
     _log(progress_cb, f"First OCR complete ({len(result['words'])} words)")
+
+    masked_image, circles, _ = suppress_margin_magnets(image_full)
+    if circles:
+        image_full = masked_image
+        _log(progress_cb, f"Masked margin magnets ({len(circles)} circles)")
+        result = _ocr_image_pil(
+            image_full,
+            lang=lang,
+            timing=timing_detail,
+            timing_prefix="stage1_masked_",
+        )
+        image_full = result["image_pil"]
+        _log(progress_cb, f"OCR after masking complete ({len(result['words'])} words)")
 
     words = result["words"]
     line_words = result["line_words"]
