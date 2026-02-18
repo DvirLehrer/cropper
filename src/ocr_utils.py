@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Tuple
 
 from PIL import Image, ImageFilter, ImageOps
 import pytesseract
+from lighting_normalization import normalize_uneven_lighting
 
 OCR_CONFIG = "--psm 4"
 
@@ -23,6 +24,7 @@ def preprocess_image(
         new_h = max(1, int(round(image.height * upscale_factor)))
         image = image.resize((new_w, new_h), Image.LANCZOS)
     gray = ImageOps.grayscale(image)
+    gray = normalize_uneven_lighting(gray)
     gray = ImageOps.autocontrast(gray, cutoff=1)
     gamma = 0.85
     gray = gray.point(lambda p: int(255 * ((p / 255) ** gamma)))

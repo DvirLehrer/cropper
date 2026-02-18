@@ -5,8 +5,17 @@ from __future__ import annotations
 
 from PIL import Image
 
-from cropper_config import BENCHMARK_DIR, CROPPED_DIR, DEBUG_DIR, LANG, OCR_TEXT_DIR, TEXT_DIR, TYPES_CSV
-from ocr_utils import iter_images, levenshtein, load_types
+from cropper_config import (
+    BENCHMARK_DIR,
+    CROPPED_DIR,
+    DEBUG_DIR,
+    LANG,
+    OCR_TEXT_DIR,
+    PREPROCESSED_DIR,
+    TEXT_DIR,
+    TYPES_CSV,
+)
+from ocr_utils import iter_images, levenshtein, load_types, preprocess_image
 from pipeline_crop_service import crop_image
 from target_texts import load_target_texts, strip_newlines
 
@@ -29,6 +38,7 @@ def main() -> None:
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     OCR_TEXT_DIR.mkdir(parents=True, exist_ok=True)
     CROPPED_DIR.mkdir(parents=True, exist_ok=True)
+    PREPROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     for path in iter_images(BENCHMARK_DIR):
         print(f"processing: {path.name}")
@@ -43,6 +53,8 @@ def main() -> None:
 
         target_chars = max(len(strip_newlines(target_for_image)), 1)
         image_full = Image.open(path).convert("RGB")
+        pre_norm = preprocess_image(image_full, upscale_factor=1.0, sharpen=False)
+        pre_norm.save(PREPROCESSED_DIR / f"{path.stem}_pre_norm.png")
         result = crop_image(
             image_full,
             lang=LANG,
