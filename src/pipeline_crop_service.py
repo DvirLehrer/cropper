@@ -10,12 +10,13 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from PIL import Image, ImageDraw, ImageFilter
 
 from cropper_config import LANG
+from lighting_normalization import normalize_uneven_lighting
 from line_block_mesh import build_block_mesh_from_lines
 from line_correction import apply_tilt, decide_correction
 from line_structure import build_pil_mesh
-from ocr_utils import preprocess_image
+from pipeline_edges import _median_char_size
 from pipeline_align import compute_opt_crop_bbox
-from pipeline_geometry import _clamp_bbox, _cluster_bbox, _stripe_roi_bbox
+from pipeline_geometry import _clamp_bbox, _cluster_bbox
 from pipeline_ocr import _ocr_image_pil, _ocr_image_pil_sparse_merge
 from magnet_mask import suppress_margin_magnets
 from target_texts import strip_newlines
@@ -55,6 +56,7 @@ def _apply_layout_correction(
             warp_result = _ocr_image_pil_sparse_merge(
                 image_full,
                 lang=lang,
+                use_lighting_normalization=False,
                 timing=timing_detail,
                 timing_prefix="crop_warp_",
             )
@@ -74,6 +76,7 @@ def _apply_layout_correction(
         tilt_result = _ocr_image_pil_sparse_merge(
             image_full,
             lang=lang,
+            use_lighting_normalization=False,
             timing=timing_detail,
             timing_prefix="crop_tilt_",
         )
@@ -135,24 +138,11 @@ def crop_image(
     result = _ocr_image_pil(
         image_full,
         lang=lang,
+        use_lighting_normalization=False,
         timing=timing_detail,
         timing_prefix="stage1_",
     )
     image_full = result["image_pil"]
-    if len(result["words"]) < 50:
-        pre_for_stripe = preprocess_image(image_full, upscale_factor=1.0, sharpen=False)
-        stripe_bbox = _stripe_roi_bbox(pre_for_stripe)
-        if stripe_bbox:
-            image_full = image_full.crop(stripe_bbox)
-            result = _ocr_image_pil(
-                image_full,
-                lang=lang,
-                allow_rotate=False,
-                timing=timing_detail,
-                timing_prefix="stage1_retry_",
-            )
-            image_full = result["image_pil"]
-            _log(progress_cb, "Applied stripe ROI retry")
     t1 = time.perf_counter()
     _log(progress_cb, f"First OCR complete ({len(result['words'])} words)")
 
@@ -163,6 +153,7 @@ def crop_image(
         result = _ocr_image_pil(
             image_full,
             lang=lang,
+            use_lighting_normalization=False,
             timing=timing_detail,
             timing_prefix="stage1_masked_",
         )
@@ -193,6 +184,7 @@ def crop_image(
         result = _ocr_image_pil(
             image_full,
             lang=lang,
+            use_lighting_normalization=False,
             timing=timing_detail,
             timing_prefix="stage2_",
         )
@@ -223,10 +215,13 @@ def crop_image(
         target_chars=target_chars,
         ocr_text=ocr_text,
     )
+    avg_char_size = _median_char_size(words) if words else None
+    stripe_ready = normalize_uneven_lighting(cropped.convert("L"), avg_char_size=avg_char_size)
     _log(progress_cb, f"Done ({cropped.width}x{cropped.height})")
 
     return {
         "cropped": cropped,
+        "stripe_ready": stripe_ready,
         "ocr_text": ocr_text,
         "text": result["text"],
         "correction": correction,

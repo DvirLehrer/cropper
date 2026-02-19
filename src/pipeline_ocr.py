@@ -23,6 +23,7 @@ def _ocr_image_pil(
     lang: str,
     min_boxes_retry: int = 50,
     allow_rotate: bool = True,
+    use_lighting_normalization: bool = False,
     timing: Dict[str, float] | None = None,
     timing_prefix: str = "",
 ) -> Dict[str, Any]:
@@ -34,7 +35,12 @@ def _ocr_image_pil(
         upscale_factor: float = 1.0,
         sharpen: bool = False,
     ) -> Dict[str, Any]:
-        pre = preprocess_image(pil_image, upscale_factor=upscale_factor, sharpen=sharpen)
+        pre = preprocess_image(
+            pil_image,
+            upscale_factor=upscale_factor,
+            sharpen=sharpen,
+            use_lighting_normalization=use_lighting_normalization,
+        )
         data = pytesseract.image_to_data(
             pre,
             lang=lang,
@@ -81,6 +87,7 @@ def _ocr_image_pil(
 def _ocr_image_pil_sparse_merge(
     image: Image.Image,
     lang: str,
+    use_lighting_normalization: bool = False,
     timing: Dict[str, float] | None = None,
     timing_prefix: str = "",
 ) -> Dict[str, Any]:
@@ -89,6 +96,7 @@ def _ocr_image_pil_sparse_merge(
         image,
         lang=lang,
         allow_rotate=False,
+        use_lighting_normalization=use_lighting_normalization,
         timing=timing,
         timing_prefix=f"{timing_prefix}sparse_base_",
     )

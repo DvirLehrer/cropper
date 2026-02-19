@@ -18,13 +18,15 @@ def preprocess_image(
     *,
     upscale_factor: float = 1.0,
     sharpen: bool = False,
+    use_lighting_normalization: bool = False,
 ) -> Image.Image:
     if upscale_factor != 1.0:
         new_w = max(1, int(round(image.width * upscale_factor)))
         new_h = max(1, int(round(image.height * upscale_factor)))
         image = image.resize((new_w, new_h), Image.LANCZOS)
     gray = ImageOps.grayscale(image)
-    gray = normalize_uneven_lighting(gray)
+    if use_lighting_normalization:
+        gray = normalize_uneven_lighting(gray)
     gray = ImageOps.autocontrast(gray, cutoff=1)
     gamma = 0.85
     gray = gray.point(lambda p: int(255 * ((p / 255) ** gamma)))

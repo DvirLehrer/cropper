@@ -3,14 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
-
-from PIL import Image
-
-STRIPE_HEIGHT_FRACS = (0.15, 0.25, 0.35, 0.5)
-STRIPE_OVERLAP = 0.5
-STRIPE_TOP_K = 2
-STRIPE_PAD_FRAC = 0.08
+from typing import Any, Dict, List, Tuple
 
 
 def _median(values: List[float]) -> float:
@@ -89,50 +82,6 @@ def _cluster_bbox(
     if return_cluster:
         return bbox, kept
     return bbox
-
-
-def _stripe_roi_bbox(pre: Image.Image) -> Optional[tuple[int, int, int, int]]:
-    if pre.mode != "L":
-        pre = pre.convert("L")
-    w, h = pre.size
-    if w < 2 or h < 2:
-        return None
-    pixels = list(pre.getdata())
-    row_edge = [0.0] * (h - 1)
-    for y in range(h - 1):
-        row_sum = 0
-        idx0 = y * w
-        idx1 = (y + 1) * w
-        for x in range(w):
-            row_sum += abs(pixels[idx1 + x] - pixels[idx0 + x])
-        row_edge[y] = row_sum / w
-    prefix = [0.0]
-    for val in row_edge:
-        prefix.append(prefix[-1] + val)
-
-    stripes: List[tuple[float, int, int]] = []
-    for frac in STRIPE_HEIGHT_FRACS:
-        stripe_h = max(2, int(round(h * frac)))
-        step = max(1, int(round(stripe_h * (1.0 - STRIPE_OVERLAP))))
-        for y in range(0, h - stripe_h + 1, step):
-            y2 = y + stripe_h
-            score = prefix[y2 - 1] - prefix[y]
-            stripes.append((score, y, y2))
-
-    if not stripes:
-        return None
-    stripes.sort(key=lambda s: s[0], reverse=True)
-    top = [s for s in stripes[:STRIPE_TOP_K] if s[0] > 0]
-    if not top:
-        return None
-    y1 = min(s[1] for s in top)
-    y2 = max(s[2] for s in top)
-    pad = int(round(h * STRIPE_PAD_FRAC))
-    y1 = max(0, y1 - pad)
-    y2 = min(h, y2 + pad)
-    if y2 <= y1:
-        return None
-    return (0, y1, w, y2)
 
 
 def _clamp_bbox(

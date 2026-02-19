@@ -15,7 +15,7 @@ from cropper_config import (
     TEXT_DIR,
     TYPES_CSV,
 )
-from ocr_utils import iter_images, levenshtein, load_types, preprocess_image
+from ocr_utils import iter_images, levenshtein, load_types
 from pipeline_crop_service import crop_image
 from target_texts import load_target_texts, strip_newlines
 
@@ -53,14 +53,13 @@ def main() -> None:
 
         target_chars = max(len(strip_newlines(target_for_image)), 1)
         image_full = Image.open(path).convert("RGB")
-        pre_norm = preprocess_image(image_full, upscale_factor=1.0, sharpen=False)
-        pre_norm.save(PREPROCESSED_DIR / f"{path.stem}_pre_norm.png")
         result = crop_image(
             image_full,
             lang=LANG,
             target_chars=target_chars,
             debug_path=DEBUG_DIR / f"{path.stem}_debug.png",
         )
+        result["stripe_ready"].save(PREPROCESSED_DIR / f"{path.stem}_dark_masked.png")
         correction = result["correction"]
         print(
             f"correction: {correction.mode} "
