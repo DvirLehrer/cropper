@@ -17,6 +17,7 @@ from cropper_config import (
 )
 from ocr_utils import iter_images, levenshtein, load_types
 from pipeline_crop_service import crop_image
+from draw_periodic_pattern import draw_periodic_pattern_for_image
 from target_texts import load_target_texts, strip_newlines
 
 
@@ -59,7 +60,16 @@ def main() -> None:
             target_chars=target_chars,
             debug_path=DEBUG_DIR / f"{path.stem}_debug.png",
         )
-        result["stripe_ready"].save(PREPROCESSED_DIR / f"{path.stem}_dark_masked.png")
+        preprocessed_path = PREPROCESSED_DIR / f"{path.stem}_dark_masked.png"
+        result["stripe_ready"].save(preprocessed_path)
+        periodic_meta = draw_periodic_pattern_for_image(preprocessed_path)
+        print(
+            "periodic: "
+            f"lag={int(periodic_meta['lag'])} "
+            f"corr={float(periodic_meta['corr']):.3f} "
+            f"peaks={int(periodic_meta['peaks'])} "
+            f"spacing_cons={float(periodic_meta['spacing_cons']):.3f}"
+        )
         correction = result["correction"]
         print(
             f"correction: {correction.mode} "
