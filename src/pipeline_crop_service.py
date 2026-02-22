@@ -10,7 +10,11 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from PIL import Image, ImageDraw, ImageFilter
 
 from cropper_config import LANG
-from lighting_normalization import normalize_uneven_lighting
+from lighting_normalization import (
+    normalize_uneven_lighting_dark_mask,
+    normalize_uneven_lighting,
+    normalize_uneven_lighting_mask_continuum_debug,
+)
 from line_block_mesh import build_block_mesh_from_lines
 from line_correction import apply_tilt, decide_correction
 from line_structure import build_pil_mesh
@@ -202,11 +206,20 @@ def crop_image(
     )
     avg_char_size = _median_char_size(words) if words else None
     stripe_ready = normalize_uneven_lighting(cropped.convert("L"), avg_char_size=avg_char_size)
+    stripe_dark_mask = normalize_uneven_lighting_dark_mask(
+        cropped.convert("L"), avg_char_size=avg_char_size
+    )
+    stripe_mask_continuum_debug = normalize_uneven_lighting_mask_continuum_debug(
+        cropped.convert("L"), avg_char_size=avg_char_size
+    )
     _log(progress_cb, f"Done ({cropped.width}x{cropped.height})")
 
     return {
         "cropped": cropped,
         "stripe_ready": stripe_ready,
+        "stripe_dark_mask": stripe_dark_mask,
+        "stripe_mask_continuum_debug": stripe_mask_continuum_debug,
+        "avg_char_size": avg_char_size,
         "ocr_text": ocr_text,
         "text": result["text"],
         "correction": correction,

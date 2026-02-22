@@ -62,14 +62,34 @@ def main() -> None:
         )
         preprocessed_path = PREPROCESSED_DIR / f"{path.stem}_dark_masked.png"
         result["stripe_ready"].save(preprocessed_path)
-        periodic_meta = draw_periodic_pattern_for_image(preprocessed_path)
+        mask_continuum_path = PREPROCESSED_DIR / f"{path.stem}_dark_masked_mask_continuum_debug.png"
+        result["stripe_mask_continuum_debug"].save(mask_continuum_path)
+        print(f"mask-continuum-debug: {mask_continuum_path.name}")
+        avg_char_size = result.get("avg_char_size")
+        min_lag_full_px = 8
+        max_lag_full_px = None
+        if isinstance(avg_char_size, (int, float)) and avg_char_size > 0:
+            # Option 1: never sparser than OCR line-scale (can be denser).
+            max_lag_full_px = max(6, int(round(1.85 * float(avg_char_size))))
+        periodic_meta = draw_periodic_pattern_for_image(
+            mask_continuum_path,
+            light_debug_image=result["cropped"],
+            light_debug_mask_image=result["stripe_dark_mask"],
+            light_debug_out_path=DEBUG_DIR / f"{path.stem}_stripe_light_debug.png",
+            min_lag_full_px=min_lag_full_px,
+            max_lag_full_px=max_lag_full_px,
+        )
         print(
             "periodic: "
             f"lag={int(periodic_meta['lag'])} "
             f"corr={float(periodic_meta['corr']):.3f} "
             f"peaks={int(periodic_meta['peaks'])} "
-            f"spacing_cons={float(periodic_meta['spacing_cons']):.3f}"
+            f"spacing_cons={float(periodic_meta['spacing_cons']):.3f} "
+            f"strength={float(periodic_meta['strength']):.3f} "
+            f"time={float(periodic_meta['periodic_time_sec']):.3f}s"
         )
+        if periodic_meta.get("light_debug_output"):
+            print(f"stripe-light-debug: {periodic_meta['light_debug_output']}")
         correction = result["correction"]
         print(
             f"correction: {correction.mode} "
