@@ -11,16 +11,14 @@ from PIL import Image
 from cropper_config import (
     BENCHMARK_DIR,
     CROPPED_DIR,
-    DEBUG_DIR,
     LANG,
     OCR_TEXT_DIR,
-    PREPROCESSED_DIR,
     TEXT_DIR,
     TYPES_CSV,
 )
 from ocr_utils import iter_images, levenshtein, load_types
 from pipeline_crop_service import crop_image
-from draw_periodic_pattern import draw_periodic_pattern_for_image
+from draw_periodic_pattern import draw_periodic_pattern_for_pil
 from target_texts import load_target_texts, strip_newlines
 
 
@@ -54,22 +52,33 @@ def _timing_report(
     total_sec: float,
 ) -> str:
     lines: list[str] = []
+    ocr1 = float(timing.get("ocr1", 0.0))
+    crop = float(timing.get("crop", 0.0))
+    ocr2 = float(timing.get("ocr2", 0.0))
+    debug = float(timing.get("debug", 0.0))
+    crop_finalize = float(timing.get("crop_finalize", 0.0))
+    post_crop_stripes = float(timing.get("post_crop_stripes", 0.0))
+    crop_core_sec = ocr1 + crop + ocr2 + debug + crop_finalize
+    crop_image_other = max(0.0, crop_image_sec - crop_core_sec - post_crop_stripes)
     other_sec = max(0.0, total_sec - crop_image_sec - periodic_sec - io_sec)
     lines.append(
         "timing "
         f"total={_fmt_seconds(total_sec)} "
-        f"crop_image={_fmt_seconds(crop_image_sec)} "
+        f"crop_core={_fmt_seconds(crop_core_sec)} "
+        f"post_crop_stripes={_fmt_seconds(post_crop_stripes)} "
+        f"crop_other={_fmt_seconds(crop_image_other)} "
         f"periodic={_fmt_seconds(periodic_sec)} "
         f"io={_fmt_seconds(io_sec)} "
         f"other={_fmt_seconds(other_sec)}"
     )
     lines.append(
         "stage "
-        f"ocr1={_fmt_seconds(float(timing.get('ocr1', 0.0)))} "
-        f"layout={_fmt_seconds(float(timing.get('layout', 0.0)))} "
-        f"crop={_fmt_seconds(float(timing.get('crop', 0.0)))} "
-        f"ocr2={_fmt_seconds(float(timing.get('ocr2', 0.0)))} "
-        f"debug={_fmt_seconds(float(timing.get('debug', 0.0)))}"
+        f"ocr1={_fmt_seconds(ocr1)} "
+        f"crop={_fmt_seconds(crop)} "
+        f"ocr2={_fmt_seconds(ocr2)} "
+        f"debug={_fmt_seconds(debug)} "
+        f"crop_finalize={_fmt_seconds(crop_finalize)} "
+        f"post_crop_stripes={_fmt_seconds(post_crop_stripes)}"
     )
 
     group_specs = [
@@ -77,13 +86,18 @@ def _timing_report(
         ("stage2_", "detail_ocr_stage2"),
         ("crop_warp_", "detail_warp"),
         ("crop_tilt_", "detail_tilt"),
+        ("post_crop_stripes_", "detail_post_crop_stripes"),
     ]
     used_keys: set[str] = set()
     for prefix, label in group_specs:
         grouped = [(k[len(prefix) :], float(v)) for k, v in timing_detail.items() if k.startswith(prefix)]
         if grouped:
             used_keys.update(k for k in timing_detail if k.startswith(prefix))
-            subtotal = sum(sec for _, sec in grouped)
+            grouped_map = {name: sec for name, sec in grouped}
+            if "sparse_total" in grouped_map:
+                subtotal = grouped_map["sparse_total"] + grouped_map.get("transform", 0.0)
+            else:
+                subtotal = sum(sec for _, sec in grouped)
             lines.append(f"{label}={_fmt_seconds(subtotal)} ({_format_top_items(grouped)})")
 
     remaining = [(k, float(v)) for k, v in timing_detail.items() if k not in used_keys]
@@ -99,10 +113,8 @@ def main() -> None:
 
     type_map = load_types(TYPES_CSV)
     target_texts = load_target_texts(TEXT_DIR)
-    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     OCR_TEXT_DIR.mkdir(parents=True, exist_ok=True)
     CROPPED_DIR.mkdir(parents=True, exist_ok=True)
-    PREPROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     for path in iter_images(BENCHMARK_DIR):
         t_total_start = time.perf_counter()
@@ -123,25 +135,22 @@ def main() -> None:
             image_full,
             lang=LANG,
             target_chars=target_chars,
-            debug_path=DEBUG_DIR / f"{path.stem}_debug.png",
+            debug_path=None,
         )
         crop_image_sec = time.perf_counter() - t_crop_start
 
         t_periodic_start = time.perf_counter()
-        preprocessed_path = PREPROCESSED_DIR / f"{path.stem}_dark_masked.png"
-        result["stripe_ready"].save(preprocessed_path)
-        mask_continuum_path = PREPROCESSED_DIR / f"{path.stem}_dark_masked_mask_continuum_debug.png"
-        result["stripe_mask_continuum_debug"].save(mask_continuum_path)
         avg_char_size = result.get("avg_char_size")
         min_lag_full_px = 8
         max_lag_full_px = None
         if isinstance(avg_char_size, (int, float)) and avg_char_size > 0:
             max_lag_full_px = max(6, int(round(1.85 * float(avg_char_size))))
-        periodic_meta = draw_periodic_pattern_for_image(
-            mask_continuum_path,
+        periodic_meta = draw_periodic_pattern_for_pil(
+            result["stripe_mask_continuum_debug"],
+            input_name=path.name,
             light_debug_image=result["cropped"],
             light_debug_mask_image=result["stripe_dark_mask"],
-            light_debug_out_path=DEBUG_DIR / f"{path.stem}_stripe_light_debug.png",
+            light_debug_out_path=None,
             min_lag_full_px=min_lag_full_px,
             max_lag_full_px=max_lag_full_px,
         )

@@ -327,6 +327,8 @@ def crop_job_result(job_id: str):
     response.headers["X-Timing-Crop"] = f"{float(timing.get('crop', 0.0)):.6f}"
     response.headers["X-Timing-OCR2"] = f"{float(timing.get('ocr2', 0.0)):.6f}"
     response.headers["X-Timing-Debug"] = f"{float(timing.get('debug', 0.0)):.6f}"
+    response.headers["X-Timing-Crop-Finalize"] = f"{float(timing.get('crop_finalize', 0.0)):.6f}"
+    response.headers["X-Timing-Post-Crop-Stripes"] = f"{float(timing.get('post_crop_stripes', 0.0)):.6f}"
     for key, value in timing_detail.items():
         header_key = "X-Timing-Detail-" + str(key).replace("_", "-")
         response.headers[header_key] = f"{float(value):.6f}"

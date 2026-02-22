@@ -9,11 +9,9 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFilter
 
-from cropper_config import LANG
+from cropper_config import LANG, POST_CROP_STRIPES_FAST_BG_MAX_DIM
 from lighting_normalization import (
-    normalize_uneven_lighting_dark_mask,
-    normalize_uneven_lighting,
-    normalize_uneven_lighting_mask_continuum_debug,
+    build_post_crop_stripes,
 )
 from line_block_mesh import build_block_mesh_from_lines
 from line_correction import apply_tilt, decide_correction
@@ -152,9 +150,6 @@ def crop_image(
     words = result["words"]
     line_words = result["line_words"]
     correction = decide_correction(line_words)
-    t2 = time.perf_counter()
-    _log(progress_cb, f"Layout mode: {correction.mode}")
-
     image_full, words, line_words, corrected_changed = _apply_layout_correction(
         image_full,
         words,
@@ -204,14 +199,29 @@ def crop_image(
         target_chars=target_chars,
         ocr_text=ocr_text,
     )
+    t6 = time.perf_counter()
     avg_char_size = _median_char_size(words) if words else None
-    stripe_ready = normalize_uneven_lighting(cropped.convert("L"), avg_char_size=avg_char_size)
-    stripe_dark_mask = normalize_uneven_lighting_dark_mask(
-        cropped.convert("L"), avg_char_size=avg_char_size
+    (
+        stripe_ready,
+        stripe_dark_mask,
+        stripe_mask_continuum_debug,
+        stripes_timing,
+    ) = build_post_crop_stripes(
+        cropped,
+        avg_char_size=avg_char_size,
+        fast_bg_max_dim=POST_CROP_STRIPES_FAST_BG_MAX_DIM,
     )
-    stripe_mask_continuum_debug = normalize_uneven_lighting_mask_continuum_debug(
-        cropped.convert("L"), avg_char_size=avg_char_size
+    timing_detail["post_crop_stripes_normalize"] = float(stripes_timing["post_crop_stripes_core"])
+    timing_detail["post_crop_stripes_dark_mask"] = float(
+        stripes_timing["post_crop_stripes_dark_mask_image"]
     )
+    timing_detail["post_crop_stripes_mask_continuum_debug"] = float(
+        stripes_timing["post_crop_stripes_mask_continuum_debug"]
+    )
+    timing_detail["post_crop_stripes_ready_image"] = float(
+        stripes_timing["post_crop_stripes_ready_image"]
+    )
+    t7 = time.perf_counter()
     _log(progress_cb, f"Done ({cropped.width}x{cropped.height})")
 
     return {
@@ -227,10 +237,11 @@ def crop_image(
         "px_per_char": px_per_char,
         "timing": {
             "ocr1": t1 - t0,
-            "layout": t2 - t1,
-            "crop": t3 - t2,
+            "crop": t3 - t1,
             "ocr2": t4 - t3,
             "debug": t5 - t4,
+            "crop_finalize": t6 - t5,
+            "post_crop_stripes": t7 - t6,
             "left": 0.0,
         },
         "timing_detail": timing_detail,
