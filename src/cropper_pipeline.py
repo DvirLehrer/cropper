@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import time
+from typing import Iterable
+
 from PIL import Image
 
 from cropper_config import (
@@ -30,6 +33,66 @@ def _target_text_for_image(image_type: str, target_texts: dict[str, str]) -> str
     return None
 
 
+def _fmt_seconds(value: float) -> str:
+    return f"{value:.3f}s"
+
+
+def _format_top_items(items: Iterable[tuple[str, float]], limit: int = 4) -> str:
+    top = sorted(items, key=lambda item: item[1], reverse=True)[:limit]
+    if not top:
+        return "none"
+    return ", ".join(f"{name}={_fmt_seconds(sec)}" for name, sec in top)
+
+
+def _timing_report(
+    timing: dict[str, float],
+    timing_detail: dict[str, float],
+    *,
+    crop_image_sec: float,
+    periodic_sec: float,
+    io_sec: float,
+    total_sec: float,
+) -> str:
+    lines: list[str] = []
+    other_sec = max(0.0, total_sec - crop_image_sec - periodic_sec - io_sec)
+    lines.append(
+        "timing "
+        f"total={_fmt_seconds(total_sec)} "
+        f"crop_image={_fmt_seconds(crop_image_sec)} "
+        f"periodic={_fmt_seconds(periodic_sec)} "
+        f"io={_fmt_seconds(io_sec)} "
+        f"other={_fmt_seconds(other_sec)}"
+    )
+    lines.append(
+        "stage "
+        f"ocr1={_fmt_seconds(float(timing.get('ocr1', 0.0)))} "
+        f"layout={_fmt_seconds(float(timing.get('layout', 0.0)))} "
+        f"crop={_fmt_seconds(float(timing.get('crop', 0.0)))} "
+        f"ocr2={_fmt_seconds(float(timing.get('ocr2', 0.0)))} "
+        f"debug={_fmt_seconds(float(timing.get('debug', 0.0)))}"
+    )
+
+    group_specs = [
+        ("stage1_", "detail_ocr_stage1"),
+        ("stage2_", "detail_ocr_stage2"),
+        ("crop_warp_", "detail_warp"),
+        ("crop_tilt_", "detail_tilt"),
+    ]
+    used_keys: set[str] = set()
+    for prefix, label in group_specs:
+        grouped = [(k[len(prefix) :], float(v)) for k, v in timing_detail.items() if k.startswith(prefix)]
+        if grouped:
+            used_keys.update(k for k in timing_detail if k.startswith(prefix))
+            subtotal = sum(sec for _, sec in grouped)
+            lines.append(f"{label}={_fmt_seconds(subtotal)} ({_format_top_items(grouped)})")
+
+    remaining = [(k, float(v)) for k, v in timing_detail.items() if k not in used_keys]
+    if remaining:
+        lines.append(f"detail_other ({_format_top_items(remaining, limit=6)})")
+
+    return "\n  ".join(lines)
+
+
 def main() -> None:
     if not BENCHMARK_DIR.exists():
         raise SystemExit(f"Benchmark dir not found: {BENCHMARK_DIR}")
@@ -42,91 +105,91 @@ def main() -> None:
     PREPROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     for path in iter_images(BENCHMARK_DIR):
-        print(f"processing: {path.name}")
+        t_total_start = time.perf_counter()
         image_type = type_map.get(path.name)
         if image_type is None:
-            print(f"warning: unknown type for {path.name}, skipping")
+            print(f"[skip] {path.name} unknown type")
             continue
         target_for_image = _target_text_for_image(image_type, target_texts)
         if target_for_image is None:
-            print(f"warning: unknown type for {path.name}, skipping")
+            print(f"[skip] {path.name} unknown type")
             continue
 
-            target_chars = max(len(strip_newlines(target_for_image)), 1)
-            image_full = Image.open(path).convert("RGB")
-            result = crop_image(
-                image_full,
-                lang=LANG,
-                target_chars=target_chars,
-                debug_path=DEBUG_DIR / f"{path.stem}_debug.png",
-            )
-            preprocessed_path = PREPROCESSED_DIR / f"{path.stem}_dark_masked.png"
-            result["stripe_ready"].save(preprocessed_path)
-            mask_continuum_path = PREPROCESSED_DIR / f"{path.stem}_dark_masked_mask_continuum_debug.png"
-            result["stripe_mask_continuum_debug"].save(mask_continuum_path)
-            print(f"mask-continuum-debug: {mask_continuum_path.name}")
-            avg_char_size = result.get("avg_char_size")
-            min_lag_full_px = 8
-            max_lag_full_px = None
-            if isinstance(avg_char_size, (int, float)) and avg_char_size > 0:
-                # Option 1: never sparser than OCR line-scale (can be denser).
-                max_lag_full_px = max(6, int(round(1.85 * float(avg_char_size))))
-            periodic_meta = draw_periodic_pattern_for_image(
-                mask_continuum_path,
-                light_debug_image=result["cropped"],
-                light_debug_mask_image=result["stripe_dark_mask"],
-                light_debug_out_path=DEBUG_DIR / f"{path.stem}_stripe_light_debug.png",
-                min_lag_full_px=min_lag_full_px,
-                max_lag_full_px=max_lag_full_px,
-            )
-            print(
-                "periodic: "
-                f"lag={int(periodic_meta['lag'])} "
-                f"corr={float(periodic_meta['corr']):.3f} "
-                f"peaks={int(periodic_meta['peaks'])} "
-                f"spacing_cons={float(periodic_meta['spacing_cons']):.3f} "
-                f"strength={float(periodic_meta['strength']):.3f} "
-                f"time={float(periodic_meta['periodic_time_sec']):.3f}s"
-            )
-            if periodic_meta.get("light_debug_output"):
-                print(f"stripe-light-debug: {periodic_meta['light_debug_output']}")
-            correction = result["correction"]
-            print(
-                f"correction: {correction.mode} "
-                f"(mean_abs={correction.mean_abs:.5f} std={correction.std:.5f} "
-                f"resid_mean={correction.resid_mean:.3f} resid_std={correction.resid_std:.3f} "
-                f"curve_std={correction.curve_std:.3f})"
-            )
+        target_chars = max(len(strip_newlines(target_for_image)), 1)
+        image_full = Image.open(path).convert("RGB")
 
-            cropped = result["cropped"]
-            cropped.save(CROPPED_DIR / f"{path.stem}_crop.png")
-            print(
-                "crop stats: "
-                f"{cropped.width}x{cropped.height} "
-                f"area={result['crop_area']} "
-                f"target_chars={target_chars} "
-                f"px_per_char={result['px_per_char']:.1f}"
-            )
-            print(
-                "timing: "
-                f"ocr1={result['timing']['ocr1']:.3f}s "
-                f"layout={result['timing']['layout']:.3f}s "
-                f"crop={result['timing']['crop']:.3f}s "
-                f"ocr2={result['timing']['ocr2']:.3f}s "
-                f"debug={result['timing']['debug']:.3f}s "
-                f"left={result['timing']['left']:.3f}s"
-            )
+        t_crop_start = time.perf_counter()
+        result = crop_image(
+            image_full,
+            lang=LANG,
+            target_chars=target_chars,
+            debug_path=DEBUG_DIR / f"{path.stem}_debug.png",
+        )
+        crop_image_sec = time.perf_counter() - t_crop_start
 
-            (OCR_TEXT_DIR / f"{path.stem}.txt").write_text(result["text"], encoding="utf-8")
-            ocr_text = result["ocr_text"]
-            if image_type == "m":
-                distance = levenshtein(ocr_text, target_texts["m"])
-                print(f"type: {image_type}  distance: {distance}")
-            else:
-                names = ("shema", "vehaya", "kadesh", "peter")
-                distances = {name: levenshtein(ocr_text, target_texts[name]) for name in names}
-                guess_name, guess_distance = min(distances.items(), key=lambda item: item[1])
-                print(f"type: {image_type}  guess: {guess_name}  distance: {guess_distance}")
+        t_periodic_start = time.perf_counter()
+        preprocessed_path = PREPROCESSED_DIR / f"{path.stem}_dark_masked.png"
+        result["stripe_ready"].save(preprocessed_path)
+        mask_continuum_path = PREPROCESSED_DIR / f"{path.stem}_dark_masked_mask_continuum_debug.png"
+        result["stripe_mask_continuum_debug"].save(mask_continuum_path)
+        avg_char_size = result.get("avg_char_size")
+        min_lag_full_px = 8
+        max_lag_full_px = None
+        if isinstance(avg_char_size, (int, float)) and avg_char_size > 0:
+            max_lag_full_px = max(6, int(round(1.85 * float(avg_char_size))))
+        periodic_meta = draw_periodic_pattern_for_image(
+            mask_continuum_path,
+            light_debug_image=result["cropped"],
+            light_debug_mask_image=result["stripe_dark_mask"],
+            light_debug_out_path=DEBUG_DIR / f"{path.stem}_stripe_light_debug.png",
+            min_lag_full_px=min_lag_full_px,
+            max_lag_full_px=max_lag_full_px,
+        )
+        periodic_sec = time.perf_counter() - t_periodic_start
+
+        t_io_start = time.perf_counter()
+        cropped = result["cropped"]
+        cropped.save(CROPPED_DIR / f"{path.stem}_crop.png")
+        (OCR_TEXT_DIR / f"{path.stem}.txt").write_text(result["text"], encoding="utf-8")
+        io_sec = time.perf_counter() - t_io_start
+        total_sec = time.perf_counter() - t_total_start
+
+        ocr_text = result["ocr_text"]
+        if image_type == "m":
+            quality_line = f"type={image_type} distance={levenshtein(ocr_text, target_texts['m'])}"
+        else:
+            names = ("shema", "vehaya", "kadesh", "peter")
+            distances = {name: levenshtein(ocr_text, target_texts[name]) for name in names}
+            guess_name, guess_distance = min(distances.items(), key=lambda item: item[1])
+            quality_line = f"type={image_type} guess={guess_name} distance={guess_distance}"
+
+        correction = result["correction"]
+        periodic_line = (
+            "periodic "
+            f"lag={int(periodic_meta['lag'])} "
+            f"corr={float(periodic_meta['corr']):.3f} "
+            f"peaks={int(periodic_meta['peaks'])} "
+            f"spacing_cons={float(periodic_meta['spacing_cons']):.3f} "
+            f"strength={float(periodic_meta['strength']):.3f}"
+        )
+        timing_line = _timing_report(
+            result["timing"],
+            result.get("timing_detail", {}),
+            crop_image_sec=crop_image_sec,
+            periodic_sec=periodic_sec,
+            io_sec=io_sec,
+            total_sec=total_sec,
+        )
+        print(
+            f"[{path.name}] {quality_line}\n"
+            f"  crop {cropped.width}x{cropped.height} area={result['crop_area']} "
+            f"target_chars={target_chars} px_per_char={result['px_per_char']:.1f}\n"
+            f"  correction mode={correction.mode} mean_abs={correction.mean_abs:.5f} "
+            f"std={correction.std:.5f} resid_mean={correction.resid_mean:.3f} "
+            f"resid_std={correction.resid_std:.3f} curve_std={correction.curve_std:.3f}\n"
+            f"  {periodic_line}\n"
+            f"  {timing_line}"
+        )
 
 
 if __name__ == "__main__":
