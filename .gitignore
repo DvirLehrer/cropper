@@ -3,3 +3,5 @@ cropped/
 debug_images/
 preprocessed/
 ocr_text/
+__pycache__/
+*.pyc

@@ -31,6 +31,11 @@ No coding conventions are defined because there is no code. For consistency with
 
 - When printing Hebrew text in scripts or debug outputs, always reverse the string for display.
 
+## Architecture Rules
+
+- The web app is an envelope for HTTP/deployment only and must not contain crop/output business logic.
+- Crop/output behavior must live in reusable service functions under `src/` so CLI and web use the same code path.
+
 ## Testing Guidelines
 
 No tests exist. If you add tests in the future, document:
