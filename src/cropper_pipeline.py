@@ -145,20 +145,22 @@ def main() -> None:
         max_lag_full_px = None
         if isinstance(avg_char_size, (int, float)) and avg_char_size > 0:
             max_lag_full_px = max(6, int(round(1.85 * float(avg_char_size))))
+        output_crop_path = CROPPED_DIR / f"{path.stem}_crop.png"
         periodic_meta = draw_periodic_pattern_for_pil(
             result["stripe_mask_continuum_debug"],
             input_name=path.name,
             light_debug_image=result["cropped"],
             light_debug_mask_image=result["stripe_dark_mask"],
-            light_debug_out_path=None,
+            light_debug_out_path=output_crop_path,
             min_lag_full_px=min_lag_full_px,
             max_lag_full_px=max_lag_full_px,
         )
         periodic_sec = time.perf_counter() - t_periodic_start
 
         t_io_start = time.perf_counter()
-        cropped = result["stripe_ready"]
-        cropped.save(CROPPED_DIR / f"{path.stem}_crop.png")
+        cropped = result["cropped"]
+        if not periodic_meta.get("light_debug_output"):
+            cropped.save(output_crop_path)
         (OCR_TEXT_DIR / f"{path.stem}.txt").write_text(result["text"], encoding="utf-8")
         io_sec = time.perf_counter() - t_io_start
         total_sec = time.perf_counter() - t_total_start
