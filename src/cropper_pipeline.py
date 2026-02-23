@@ -157,7 +157,7 @@ def main() -> None:
         periodic_sec = time.perf_counter() - t_periodic_start
 
         t_io_start = time.perf_counter()
-        cropped = result["cropped"]
+        cropped = result["stripe_ready"]
         cropped.save(CROPPED_DIR / f"{path.stem}_crop.png")
         (OCR_TEXT_DIR / f"{path.stem}.txt").write_text(result["text"], encoding="utf-8")
         io_sec = time.perf_counter() - t_io_start
