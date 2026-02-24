@@ -184,30 +184,3 @@ def align_edges_shift_side(
         alterations=res.alterations,
         objective=res.objective,
     )
-
-
-def _format_result(res: AlignResult) -> str:
-    return (
-        f"y={res.y}\n"
-        f"line_x={res.line_x:.3f}\n"
-        f"quad={res.quad:.3f}\n"
-        f"alterations={res.alterations}\n"
-        f"objective={res.objective:.3f}"
-    )
-
-
-def main() -> None:
-    # Example usage with a tiny synthetic input.
-    candidates = [
-        [100, 110, 120],
-        [102, 115],
-        [98, 105, 130],
-        [101, 112],
-    ]
-    left_edges = [c[0] for c in candidates]
-    res = align_edges_shift(candidates, left_edges, strategy="next")
-    print(_format_result(res))
-
-
-if __name__ == "__main__":
-    main()

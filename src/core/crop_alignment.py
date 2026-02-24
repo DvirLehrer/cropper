@@ -5,8 +5,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from edge_align_shift import align_edges_shift_side
-from pipeline_edges import (
+from core.edge_shift import align_edges_shift_side
+from core.edge_candidates import (
     _edge_flags,
     _filter_boxes_by_char_size,
     _filter_outliers,
@@ -14,7 +14,7 @@ from pipeline_edges import (
     _median_word_height,
     _next_candidates,
 )
-from pipeline_geometry import _clamp_bbox, _median
+from core.geometry import _clamp_bbox, _median
 
 
 def _line_bottoms(line_words: List[List[Dict[str, Any]]]) -> List[float]:

@@ -9,58 +9,19 @@ import time
 from typing import Optional
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
+from config import settings
 
-MASK_THR = 250
-FLAT_RANGE_MAX = 8
-MAX_WORK_WIDTH = 1200
-ROW_BAND_MARGIN_FRAC = 0.03
-ROW_BAND_MARGIN_MIN_PX = 8
-DEBUG_WHITE_BAND_HALF_PX = 5
-DEBUG_FILL_TILE_SIZE_PX = 56
-DEBUG_FILL_SAMPLE_STRIDE_PX = 4
-ABORT_MIN_ENERGY_STRENGTH = 0.85
-ABORT_MIN_ROW_EDGE_STRENGTH = 0.40
-ABORT_MIN_MEAN_COVERAGE_STRENGTH = 0.40
-ENABLE_PERIODIC_PATTERN_DEBUG = True
 
 
 def _mask_pixels(gray: Image.Image) -> list[bool]:
     # Fast C-level approximation of "bright + locally flat" masked regions.
-    bright = gray.point(lambda p: 255 if p >= MASK_THR else 0)
+    bright = gray.point(lambda p: 255 if p >= settings.periodic.mask_thr else 0)
     local_min = gray.filter(ImageFilter.MinFilter(size=3))
     local_max = gray.filter(ImageFilter.MaxFilter(size=3))
     local_range = ImageChops.subtract(local_max, local_min)
-    flat = local_range.point(lambda p: 255 if p <= FLAT_RANGE_MAX else 0)
+    flat = local_range.point(lambda p: 255 if p <= settings.periodic.flat_range_max else 0)
     combined = ImageChops.multiply(bright, flat)
     return [v > 0 for v in combined.getdata()]
-
-
-def _masked_row_band(mask: list[bool], w: int, h: int) -> Optional[tuple[int, int]]:
-    min_row_masked = max(8, int(round(0.01 * w)))
-    rows: list[tuple[int, int]] = []
-    for y in range(h):
-        s = y * w
-        cnt = sum(1 for x in range(w) if mask[s + x])
-        if cnt >= min_row_masked:
-            rows.append((y, cnt))
-    if not rows:
-        return None
-    clusters: list[tuple[int, int, int]] = []
-    y0 = rows[0][0]
-    yp = rows[0][0]
-    mass = rows[0][1]
-    for y, cnt in rows[1:]:
-        if y <= yp + 1:
-            yp = y
-            mass += cnt
-            continue
-        clusters.append((y0, yp, mass))
-        y0 = y
-        yp = y
-        mass = cnt
-    clusters.append((y0, yp, mass))
-    best = max(clusters, key=lambda c: c[2])
-    return best[0], best[1]
 
 
 def _sobel_abs(gray: Image.Image, kernel: tuple[int, ...]) -> Image.Image:
@@ -573,68 +534,14 @@ def _two_segment_from_intervals(
     return (x_left, y_left), (x_mid, y_mid), (x_right, y_right)
 
 
-def _median(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    s = sorted(values)
-    m = len(s) // 2
-    if len(s) % 2 == 1:
-        return float(s[m])
-    return 0.5 * float(s[m - 1] + s[m])
-
-
 def _work_image(gray_full: Image.Image) -> tuple[Image.Image, float]:
     w, h = gray_full.size
-    if w <= MAX_WORK_WIDTH:
+    if w <= settings.periodic.max_work_width:
         return gray_full, 1.0
-    scale = MAX_WORK_WIDTH / float(max(1, w))
+    scale = settings.periodic.max_work_width / float(max(1, w))
     new_w = max(1, int(round(w * scale)))
     new_h = max(1, int(round(h * scale)))
     return gray_full.resize((new_w, new_h), Image.BILINEAR), scale
-
-
-def _row_slope(p0: tuple[int, int], p1: tuple[int, int]) -> float:
-    dx = float(max(1, p1[0] - p0[0]))
-    return float((p1[1] - p0[1]) / dx)
-
-
-def _clamp_row_to_slope_ballpark(
-    p0: tuple[int, int],
-    pm: tuple[int, int],
-    p1: tuple[int, int],
-    *,
-    target_slope: float,
-    tol: float,
-    h: int,
-) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
-    lo = target_slope - tol
-    hi = target_slope + tol
-
-    x0, y0 = p0
-    xm, ym = pm
-    x1, y1 = p1
-
-    # Clamp left and right halves independently so one side does not pull the other off-pattern.
-    left_dx = float(max(1, xm - x0))
-    right_dx = float(max(1, x1 - xm))
-    left_slope = float((ym - y0) / left_dx)
-    right_slope = float((y1 - ym) / right_dx)
-
-    if left_slope < lo:
-        left_slope = lo
-    elif left_slope > hi:
-        left_slope = hi
-    if right_slope < lo:
-        right_slope = lo
-    elif right_slope > hi:
-        right_slope = hi
-
-    y0n = int(round(ym - left_slope * left_dx))
-    y1n = int(round(ym + right_slope * right_dx))
-    y0n = max(0, min(h - 1, y0n))
-    ymn = max(0, min(h - 1, ym))
-    y1n = max(0, min(h - 1, y1n))
-    return (x0, y0n), (xm, ymn), (x1, y1n)
 
 
 def _save_vertical_lighten_debug(
@@ -670,8 +577,8 @@ def _save_vertical_lighten_debug(
             for x in range(xa, xb + 1):
                 t = (x - xa) / float(dx)
                 yc = int(round(ya + (yb - ya) * t))
-                y_lo = max(0, yc - DEBUG_WHITE_BAND_HALF_PX)
-                y_hi = min(h - 1, yc + DEBUG_WHITE_BAND_HALF_PX)
+                y_lo = max(0, yc - settings.periodic.debug_white_band_half_px)
+                y_hi = min(h - 1, yc + settings.periodic.debug_white_band_half_px)
                 for y in range(y_lo, y_hi + 1):
                     i = y * w + x
                     if mask[i]:
@@ -687,8 +594,8 @@ def _save_vertical_lighten_debug(
         dbg.save(out_path.with_name(f"{out_path.stem}_white_zone_debug.png"))
 
     # Build coarse cached surrounding colors (non-masked, non-target) using sparse pseudo-random samples.
-    tile = max(8, DEBUG_FILL_TILE_SIZE_PX)
-    stride = max(1, DEBUG_FILL_SAMPLE_STRIDE_PX)
+    tile = max(8, settings.periodic.debug_fill_tile_size_px)
+    stride = max(1, settings.periodic.debug_fill_sample_stride_px)
     gw = (w + tile - 1) // tile
     gh = (h + tile - 1) // tile
     tile_mean: list[tuple[int, int, int] | None] = [None] * (gw * gh)
@@ -797,12 +704,59 @@ def _draw_periodic_from_gray_full(
     gray, scale = _work_image(gray_full)
     w, h = gray.size
     inv_scale = 1.0 / scale
-    min_lag_work: Optional[int] = None
-    if min_lag_full_px is not None and min_lag_full_px > 0:
-        min_lag_work = max(6, int(round(min_lag_full_px * scale)))
-    max_lag_work: Optional[int] = None
-    if max_lag_full_px is not None and max_lag_full_px > 0:
-        max_lag_work = max(6, int(round(max_lag_full_px * scale)))
+    output_name = out_path.name if out_path is not None else ""
+
+    def _scaled_lag(lag_full_px: Optional[int]) -> Optional[int]:
+        if lag_full_px is None or lag_full_px <= 0:
+            return None
+        return max(6, int(round(lag_full_px * scale)))
+
+    min_lag_work = _scaled_lag(min_lag_full_px)
+    max_lag_work = _scaled_lag(max_lag_full_px)
+
+    def _save_passthrough() -> None:
+        if out_path is None:
+            return
+        gray_full.convert("RGB").save(out_path)
+
+    def _build_meta(
+        *,
+        lag: int,
+        corr: float,
+        peaks: int,
+        spacing_cons: float,
+        strength: float,
+        light_out_name: str,
+        energy_strength: float,
+        binary_strength: float,
+        row_edge_strength: float,
+        row_dark_strength: float,
+        row_combined_strength: float,
+        mean_coverage_strength: float,
+        abort_stage: str = "",
+    ) -> dict[str, float | int | str]:
+        meta: dict[str, float | int | str] = {
+            "input": input_name,
+            "output": output_name,
+            "lag": lag,
+            "corr": corr,
+            "peaks": peaks,
+            "spacing_cons": spacing_cons,
+            "strength": strength,
+            "periodic_time_sec": time.perf_counter() - t0,
+            "scale": scale,
+            "light_debug_output": light_out_name,
+            "energy_strength": energy_strength,
+            "binary_strength": binary_strength,
+            "row_edge_strength": row_edge_strength,
+            "row_dark_strength": row_dark_strength,
+            "row_combined_strength": row_combined_strength,
+            "mean_coverage_strength": mean_coverage_strength,
+        }
+        if abort_stage:
+            meta["aborted"] = 1
+            meta["abort_stage"] = abort_stage
+        return meta
 
     valid = [True] * (w * h)
     # Do not constrain periodic search by mask band; search full vertical range.
@@ -816,33 +770,23 @@ def _draw_periodic_from_gray_full(
         energy_strength = (float(e_p90) / float(max(1, e_max))) if e_max > 0 else 0.0
     else:
         energy_strength = 0.0
-    if energy_strength < ABORT_MIN_ENERGY_STRENGTH:
-        out = gray_full.convert("RGB")
-        if out_path is not None:
-            out.save(out_path)
-        light_out_name = ""
-        t_sec = time.perf_counter() - t0
-        meta = {
-            "input": input_name,
-            "output": out_path.name if out_path is not None else "",
-            "lag": 0,
-            "corr": 0.0,
-            "peaks": 0,
-            "spacing_cons": 0.0,
-            "strength": 0.0,
-            "periodic_time_sec": t_sec,
-            "scale": scale,
-            "light_debug_output": light_out_name,
-            "energy_strength": energy_strength,
-            "binary_strength": 0.0,
-            "row_edge_strength": 0.0,
-            "row_dark_strength": 0.0,
-            "row_combined_strength": 0.0,
-            "mean_coverage_strength": 0.0,
-            "aborted": 1,
-            "abort_stage": "energy_strength",
-        }
-        return meta
+    if energy_strength < settings.periodic.abort_min_energy_strength:
+        _save_passthrough()
+        return _build_meta(
+            lag=0,
+            corr=0.0,
+            peaks=0,
+            spacing_cons=0.0,
+            strength=0.0,
+            light_out_name="",
+            energy_strength=energy_strength,
+            binary_strength=0.0,
+            row_edge_strength=0.0,
+            row_dark_strength=0.0,
+            row_combined_strength=0.0,
+            mean_coverage_strength=0.0,
+            abort_stage="energy_strength",
+        )
     binary = _binary_from_local_thresholds(energy, valid, w, h, q=0.88, block_w=max(72, w // 14))
     valid_count = sum(1 for v in valid if v)
     binary_on_count = sum(binary[i] for i in range(w * h) if valid[i])
@@ -853,33 +797,23 @@ def _draw_periodic_from_gray_full(
     row_edge_strength = max(sig_edge) if sig_edge else 0.0
     row_dark_strength = max(sig_dark) if sig_dark else 0.0
     row_combined_strength = max(sig) if sig else 0.0
-    if row_edge_strength < ABORT_MIN_ROW_EDGE_STRENGTH:
-        out = gray_full.convert("RGB")
-        if out_path is not None:
-            out.save(out_path)
-        light_out_name = ""
-        t_sec = time.perf_counter() - t0
-        meta = {
-            "input": input_name,
-            "output": out_path.name if out_path is not None else "",
-            "lag": 0,
-            "corr": 0.0,
-            "peaks": 0,
-            "spacing_cons": 0.0,
-            "strength": 0.0,
-            "periodic_time_sec": t_sec,
-            "scale": scale,
-            "light_debug_output": light_out_name,
-            "energy_strength": energy_strength,
-            "binary_strength": binary_strength,
-            "row_edge_strength": row_edge_strength,
-            "row_dark_strength": row_dark_strength,
-            "row_combined_strength": row_combined_strength,
-            "mean_coverage_strength": 0.0,
-            "aborted": 1,
-            "abort_stage": "row_edge_strength",
-        }
-        return meta
+    if row_edge_strength < settings.periodic.abort_min_row_edge_strength:
+        _save_passthrough()
+        return _build_meta(
+            lag=0,
+            corr=0.0,
+            peaks=0,
+            spacing_cons=0.0,
+            strength=0.0,
+            light_out_name="",
+            energy_strength=energy_strength,
+            binary_strength=binary_strength,
+            row_edge_strength=row_edge_strength,
+            row_dark_strength=row_dark_strength,
+            row_combined_strength=row_combined_strength,
+            mean_coverage_strength=0.0,
+            abort_stage="row_edge_strength",
+        )
     quarter_lags: list[int] = []
     quarter_corrs: list[float] = []
     y_mid = (y_lo + y_hi) // 2
@@ -940,18 +874,6 @@ def _draw_periodic_from_gray_full(
         row_models[y] = model
         return model
 
-    # Use only rows directly produced by autocorrelation peak detection.
-    dominant_slope = 0.0
-    if eff_lag > 0 and peaks:
-        for y in peaks:
-            _build_row_model(y)
-
-        angles = [
-            float((m[2][1] - m[0][1]) / float(max(1, (m[2][0] - m[0][0]))))
-            for m in row_models.values()
-        ]
-        dominant_slope = _median(angles)
-
     lines_full: list[tuple[tuple[int, int], tuple[int, int], tuple[int, int]]] = []
     covs: list[float] = []
     for y in peaks:
@@ -962,34 +884,23 @@ def _draw_periodic_from_gray_full(
         p1f = (int(round(p1[0] * inv_scale)), int(round(p1[1] * inv_scale)))
         lines_full.append((p0f, pmf, p1f))
     mean_cov = (sum(covs) / float(len(covs))) if covs else 0.0
-    if mean_cov < ABORT_MIN_MEAN_COVERAGE_STRENGTH:
-        out = gray_full.convert("RGB")
-        if out_path is not None:
-            out.save(out_path)
-        light_out_name = ""
-        t_sec = time.perf_counter() - t0
-        strength = 0.0
-        meta = {
-            "input": input_name,
-            "output": out_path.name if out_path is not None else "",
-            "lag": int(round(eff_lag * inv_scale)),
-            "corr": corr,
-            "peaks": len(peaks),
-            "spacing_cons": spacing_cons,
-            "strength": strength,
-            "periodic_time_sec": t_sec,
-            "scale": scale,
-            "light_debug_output": light_out_name,
-            "energy_strength": energy_strength,
-            "binary_strength": binary_strength,
-            "row_edge_strength": row_edge_strength,
-            "row_dark_strength": row_dark_strength,
-            "row_combined_strength": row_combined_strength,
-            "mean_coverage_strength": mean_cov,
-            "aborted": 1,
-            "abort_stage": "mean_coverage_strength",
-        }
-        return meta
+    if mean_cov < settings.periodic.abort_min_mean_coverage_strength:
+        _save_passthrough()
+        return _build_meta(
+            lag=int(round(eff_lag * inv_scale)),
+            corr=corr,
+            peaks=len(peaks),
+            spacing_cons=spacing_cons,
+            strength=0.0,
+            light_out_name="",
+            energy_strength=energy_strength,
+            binary_strength=binary_strength,
+            row_edge_strength=row_edge_strength,
+            row_dark_strength=row_dark_strength,
+            row_combined_strength=row_combined_strength,
+            mean_coverage_strength=mean_cov,
+            abort_stage="mean_coverage_strength",
+        )
 
     out = gray_full.convert("RGB")
     d = ImageDraw.Draw(out)
@@ -1019,44 +930,19 @@ def _draw_periodic_from_gray_full(
         _save_vertical_lighten_debug(debug_src, mask_full, lines_full, light_debug_out_path)
         light_out_name = light_debug_out_path.name
     strength = max(0.0, min(1.0, float(corr) * float(spacing_cons) * float(mean_cov)))
-    t_sec = time.perf_counter() - t0
-    meta = {
-        "input": input_name,
-        "output": out_path.name if out_path is not None else "",
-        "lag": lag_full,
-        "corr": corr,
-        "peaks": len(peaks),
-        "spacing_cons": spacing_cons,
-        "strength": strength,
-        "periodic_time_sec": t_sec,
-        "scale": scale,
-        "light_debug_output": light_out_name,
-        "energy_strength": energy_strength,
-        "binary_strength": binary_strength,
-        "row_edge_strength": row_edge_strength,
-        "row_dark_strength": row_dark_strength,
-        "row_combined_strength": row_combined_strength,
-        "mean_coverage_strength": mean_cov,
-    }
-    return meta
-
-
-def draw_periodic_pattern_for_image(
-    path: Path,
-    *,
-    light_debug_image: Optional[Image.Image] = None,
-    light_debug_mask_image: Optional[Image.Image] = None,
-    light_debug_out_path: Optional[Path] = None,
-    min_lag_full_px: Optional[int] = None,
-    max_lag_full_px: Optional[int] = None,
-) -> dict[str, float | int | str]:
-    return draw_periodic(
-        path,
-        light_debug_image=light_debug_image,
-        light_debug_mask_image=light_debug_mask_image,
-        light_debug_out_path=light_debug_out_path,
-        min_lag_full_px=min_lag_full_px,
-        max_lag_full_px=max_lag_full_px,
+    return _build_meta(
+        lag=lag_full,
+        corr=corr,
+        peaks=len(peaks),
+        spacing_cons=spacing_cons,
+        strength=strength,
+        light_out_name=light_out_name,
+        energy_strength=energy_strength,
+        binary_strength=binary_strength,
+        row_edge_strength=row_edge_strength,
+        row_dark_strength=row_dark_strength,
+        row_combined_strength=row_combined_strength,
+        mean_coverage_strength=mean_cov,
     )
 
 
@@ -1088,7 +974,7 @@ def main() -> None:
     ap.add_argument("image", nargs="?")
     args = ap.parse_args()
     if not args.image:
-        raise SystemExit("Provide one image path. Example: python src/draw_periodic_pattern.py preprocessed/foo.png")
+        raise SystemExit("Provide one image path. Example: python src/stripes.py preprocessed/foo.png")
     draw_periodic(Path(args.image))
 
 

@@ -9,7 +9,7 @@ from typing import Any
 
 from PIL import Image
 
-from draw_periodic_pattern import draw_periodic_pattern_for_pil
+from stripes import draw_periodic_pattern_for_pil
 
 
 def _periodic_lag_bounds(avg_char_size: float | None) -> tuple[int, int | None]:

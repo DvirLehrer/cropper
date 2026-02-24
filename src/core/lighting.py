@@ -7,27 +7,16 @@ import time
 from collections import deque
 
 from PIL import Image, ImageFilter
-
-MIN_BLUR_RADIUS = 12
-MAX_BLUR_RADIUS = 72
-BLUR_SIZE_FRAC = 0.045
-DIVIDE_GAIN = 168
-NORM_BLEND_ALPHA = 0.28
-DARK_MASK_PERCENTILE = 0.20
-MASK_VERTICAL_EXPAND_PERCENTILE = 0.30
-CONTRAST_CUTOFF = 0.02
-LIGHTEN_GAIN = 1.22
-LIGHTEN_BIAS = 14
-MASK_FILL_MEAN_WINDOW_PX = 16
-MASK_FILL_NOISE_AMPLITUDE = 2
+from config import settings
 
 
 def _blur_radius_for_size(width: int, height: int) -> int:
-    base = int(round(min(width, height) * BLUR_SIZE_FRAC))
-    if base < MIN_BLUR_RADIUS:
-        return MIN_BLUR_RADIUS
-    if base > MAX_BLUR_RADIUS:
-        return MAX_BLUR_RADIUS
+    cfg = settings.lighting
+    base = int(round(min(width, height) * cfg.blur_size_frac))
+    if base < cfg.min_blur_radius:
+        return cfg.min_blur_radius
+    if base > cfg.max_blur_radius:
+        return cfg.max_blur_radius
     return base
 
 
@@ -259,6 +248,7 @@ def _normalize_core(
     avg_char_size: float | None,
     fast_bg_max_dim: int | None = None,
 ) -> tuple[list[int], list[bool], int, int]:
+    cfg = settings.lighting
     gray = gray.convert("L")
     original = gray.copy()
 
@@ -269,7 +259,7 @@ def _normalize_core(
 
     out = []
     for p, b in zip(src, back):
-        val = (DIVIDE_GAIN * (p + 1)) // (b + 1)
+        val = (cfg.divide_gain * (p + 1)) // (b + 1)
         if val < 0:
             val = 0
         elif val > 255:
@@ -278,11 +268,11 @@ def _normalize_core(
 
     norm = Image.new("L", gray.size)
     norm.putdata(out)
-    blended = Image.blend(original, norm, NORM_BLEND_ALPHA)
+    blended = Image.blend(original, norm, cfg.norm_blend_alpha)
 
     w, h = blended.size
     px2 = list(blended.getdata())
-    dark_thr = _percentile_threshold(px2, DARK_MASK_PERCENTILE)
+    dark_thr = _percentile_threshold(px2, cfg.dark_mask_percentile)
     dark_mask = [v <= dark_thr for v in px2]
     dark_mask = _augment_with_trapped_small_regions(
         dark_mask,
@@ -291,17 +281,17 @@ def _normalize_core(
         avg_char_size=avg_char_size,
     )
     dark_mask = _expand_mask_vertical_by_percentile(
-        px2, dark_mask, w, h, MASK_VERTICAL_EXPAND_PERCENTILE
+        px2, dark_mask, w, h, cfg.mask_vertical_expand_percentile
     )
     dark_mask = _expand_mask_2px(dark_mask, w, h)
 
-    contrasted = _masked_autocontrast(px2, dark_mask, CONTRAST_CUTOFF)
+    contrasted = _masked_autocontrast(px2, dark_mask, cfg.contrast_cutoff)
     out2 = list(contrasted)
     for i, v0 in enumerate(contrasted):
         if dark_mask[i]:
             out2[i] = 255
             continue
-        v = int(v0 * LIGHTEN_GAIN + LIGHTEN_BIAS)
+        v = int(v0 * cfg.lighten_gain + cfg.lighten_bias)
         if v > 255:
             v = 255
         out2[i] = v

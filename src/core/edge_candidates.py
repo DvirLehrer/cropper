@@ -6,7 +6,7 @@ from __future__ import annotations
 import bisect
 from typing import Any, Dict, List, Tuple
 
-from pipeline_geometry import _median
+from core.geometry import _median
 
 
 def _median_char_size(words: List[Dict[str, Any]]) -> float:

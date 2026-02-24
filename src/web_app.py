@@ -18,7 +18,7 @@ from flask import Flask, Response, jsonify, render_template_string, request, sen
 import PIL
 import pytesseract
 
-from web_cropper import crop_uploaded_image_bytes
+from web_api import crop_uploaded_image_bytes
 
 app = Flask(__name__)
 JOBS: dict[str, dict] = {}

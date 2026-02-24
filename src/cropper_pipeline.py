@@ -1,196 +1,247 @@
 #!/usr/bin/env python3
-"""Run Hebrew OCR crop pipeline on benchmark images."""
+"""Shared single-image crop pipeline used by CLI and web."""
 
 from __future__ import annotations
 
 import time
-from typing import Iterable
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Tuple
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 
-from cropper_config import (
-    BENCHMARK_DIR,
-    CROPPED_DIR,
-    LANG,
-    OCR_TEXT_DIR,
-    TEXT_DIR,
-    TYPES_CSV,
+from config import settings
+from core.lighting import (
+    build_post_crop_stripes,
 )
-from ocr_utils import iter_images, levenshtein, load_types
-from output_pipeline import build_output_image_from_crop_result
-from pipeline_crop_service import crop_image
-from target_texts import load_target_texts, strip_newlines
+from core.line_mesh import build_block_mesh_from_lines
+from core.line_fix import apply_tilt, decide_correction
+from core.line_models import build_pil_mesh
+from core.edge_candidates import _median_char_size
+from core.crop_alignment import compute_opt_crop_bbox
+from core.geometry import _clamp_bbox, _cluster_bbox
+from ocr import _ocr_image_pil, _ocr_image_pil_sparse_merge
+from core.settings_texts import strip_newlines
 
 
-def _target_text_for_image(image_type: str, target_texts: dict[str, str]) -> str | None:
-    if image_type == "m":
-        return target_texts["m"]
-    if image_type in ("s", "v", "k", "p"):
-        key = {"s": "shema", "v": "vehaya", "k": "kadesh", "p": "peter"}[image_type]
-        return target_texts[key]
-    return None
+def _log(progress_cb: Optional[Callable[[str], None]], message: str) -> None:
+    if progress_cb:
+        progress_cb(message)
 
 
-def _fmt_seconds(value: float) -> str:
-    return f"{value:.3f}s"
-
-
-def _format_top_items(items: Iterable[tuple[str, float]], limit: int = 4) -> str:
-    top = sorted(items, key=lambda item: item[1], reverse=True)[:limit]
-    if not top:
-        return "none"
-    return ", ".join(f"{name}={_fmt_seconds(sec)}" for name, sec in top)
-
-
-def _timing_report(
-    timing: dict[str, float],
-    timing_detail: dict[str, float],
+def _apply_layout_correction(
+    image_full: Image.Image,
+    words: list[dict[str, Any]],
+    line_words: list[list[dict[str, Any]]],
     *,
-    crop_image_sec: float,
-    periodic_sec: float,
-    io_sec: float,
-    total_sec: float,
-) -> str:
-    lines: list[str] = []
-    ocr1 = float(timing.get("ocr1", 0.0))
-    crop = float(timing.get("crop", 0.0))
-    ocr2 = float(timing.get("ocr2", 0.0))
-    debug = float(timing.get("debug", 0.0))
-    crop_finalize = float(timing.get("crop_finalize", 0.0))
-    post_crop_stripes = float(timing.get("post_crop_stripes", 0.0))
-    crop_core_sec = ocr1 + crop + ocr2 + debug + crop_finalize
-    crop_image_other = max(0.0, crop_image_sec - crop_core_sec - post_crop_stripes)
-    other_sec = max(0.0, total_sec - crop_image_sec - periodic_sec - io_sec)
-    lines.append(
-        "timing "
-        f"total={_fmt_seconds(total_sec)} "
-        f"crop_core={_fmt_seconds(crop_core_sec)} "
-        f"post_crop_stripes={_fmt_seconds(post_crop_stripes)} "
-        f"crop_other={_fmt_seconds(crop_image_other)} "
-        f"periodic={_fmt_seconds(periodic_sec)} "
-        f"io={_fmt_seconds(io_sec)} "
-        f"other={_fmt_seconds(other_sec)}"
-    )
-    lines.append(
-        "stage "
-        f"ocr1={_fmt_seconds(ocr1)} "
-        f"crop={_fmt_seconds(crop)} "
-        f"ocr2={_fmt_seconds(ocr2)} "
-        f"debug={_fmt_seconds(debug)} "
-        f"crop_finalize={_fmt_seconds(crop_finalize)} "
-        f"post_crop_stripes={_fmt_seconds(post_crop_stripes)}"
-    )
+    lang: str,
+    timing_detail: Dict[str, float],
+) -> tuple[Image.Image, list[dict[str, Any]], list[list[dict[str, Any]]], bool]:
+    correction = decide_correction(line_words)
+    changed = False
 
-    group_specs = [
-        ("stage1_", "detail_ocr_stage1"),
-        ("stage2_", "detail_ocr_stage2"),
-        ("crop_warp_", "detail_warp"),
-        ("crop_tilt_", "detail_tilt"),
-        ("post_crop_stripes_", "detail_post_crop_stripes"),
-    ]
-    used_keys: set[str] = set()
-    for prefix, label in group_specs:
-        grouped = [(k[len(prefix) :], float(v)) for k, v in timing_detail.items() if k.startswith(prefix)]
-        if grouped:
-            used_keys.update(k for k in timing_detail if k.startswith(prefix))
-            grouped_map = {name: sec for name, sec in grouped}
-            if "sparse_total" in grouped_map:
-                subtotal = grouped_map["sparse_total"] + grouped_map.get("transform", 0.0)
+    if settings.crop_service.enable_line_warp and settings.crop_service.apply_line_correction and correction.mode == "warp":
+        xs, ys, grid = build_block_mesh_from_lines(line_words, image_full.width, image_full.height, grid_step=80)
+        mesh = build_pil_mesh(xs, ys, grid)
+        if mesh:
+            original_image = image_full
+            original_words = words
+            original_line_words = line_words
+            t_transform = time.perf_counter()
+            image_full = image_full.transform(image_full.size, Image.MESH, mesh, resample=Image.BICUBIC)
+            timing_detail["crop_warp_transform"] = time.perf_counter() - t_transform
+            warp_result = _ocr_image_pil_sparse_merge(
+                image_full,
+                lang=lang,
+                use_lighting_normalization=False,
+                timing=timing_detail,
+                timing_prefix="crop_warp_",
+            )
+            words = warp_result["words"]
+            line_words = warp_result["line_words"]
+            post = decide_correction(line_words)
+            if post.curve_std > correction.curve_std * 1.05 or post.resid_mean > correction.resid_mean * 1.05:
+                image_full = original_image
+                words = original_words
+                line_words = original_line_words
             else:
-                subtotal = sum(sec for _, sec in grouped)
-            lines.append(f"{label}={_fmt_seconds(subtotal)} ({_format_top_items(grouped)})")
-
-    remaining = [(k, float(v)) for k, v in timing_detail.items() if k not in used_keys]
-    if remaining:
-        lines.append(f"detail_other ({_format_top_items(remaining, limit=6)})")
-
-    return "\n  ".join(lines)
-
-
-def main() -> None:
-    if not BENCHMARK_DIR.exists():
-        raise SystemExit(f"Benchmark dir not found: {BENCHMARK_DIR}")
-
-    type_map = load_types(TYPES_CSV)
-    target_texts = load_target_texts(TEXT_DIR)
-    OCR_TEXT_DIR.mkdir(parents=True, exist_ok=True)
-    CROPPED_DIR.mkdir(parents=True, exist_ok=True)
-
-    for path in iter_images(BENCHMARK_DIR):
-        t_total_start = time.perf_counter()
-        image_type = type_map.get(path.name)
-        if image_type is None:
-            print(f"[skip] {path.name} unknown type")
-            continue
-        target_for_image = _target_text_for_image(image_type, target_texts)
-        if target_for_image is None:
-            print(f"[skip] {path.name} unknown type")
-            continue
-
-        target_chars = max(len(strip_newlines(target_for_image)), 1)
-        image_full = Image.open(path).convert("RGB")
-
-        t_crop_start = time.perf_counter()
-        result = crop_image(
+                changed = True
+    elif settings.crop_service.enable_line_warp and settings.crop_service.apply_line_correction and correction.mode == "tilt":
+        t_tilt = time.perf_counter()
+        image_full = apply_tilt(image_full, words, correction.slope)
+        timing_detail["crop_tilt_transform"] = time.perf_counter() - t_tilt
+        tilt_result = _ocr_image_pil_sparse_merge(
             image_full,
-            lang=LANG,
-            target_chars=target_chars,
-            debug_path=None,
+            lang=lang,
+            use_lighting_normalization=False,
+            timing=timing_detail,
+            timing_prefix="crop_tilt_",
         )
-        crop_image_sec = time.perf_counter() - t_crop_start
+        words = tilt_result["words"]
+        line_words = tilt_result["line_words"]
+        changed = True
 
-        t_periodic_start = time.perf_counter()
-        cropped_output, periodic_meta = build_output_image_from_crop_result(
-            input_name=path.name,
-            crop_result=result,
+    return image_full, words, line_words, changed
+
+
+def _apply_initial_cluster_crop(
+    image_full: Image.Image,
+    words: list[dict[str, Any]],
+) -> tuple[Image.Image, bool]:
+    cluster_result = _cluster_bbox(words, return_cluster=True)
+    if not cluster_result:
+        return image_full, False
+    crop_bbox = _clamp_bbox(cluster_result[0], image_full.width, image_full.height)
+    if not crop_bbox:
+        return image_full, False
+    return image_full.crop(crop_bbox), True
+
+
+def _write_debug_overlay(debug_path: Path, image_full: Image.Image, words: list[dict[str, Any]]) -> None:
+    debug_image = image_full.copy()
+    draw = ImageDraw.Draw(debug_image)
+    for w in words:
+        draw.rectangle([w["x1"], w["y1"], w["x2"], w["y2"]], outline=(0, 200, 0), width=2)
+    debug_image.save(debug_path)
+
+
+def _finalize_crop(
+    image_full: Image.Image,
+    opt_crop_bbox: Optional[Tuple[int, int, int, int]],
+    *,
+    target_chars: Optional[int],
+    ocr_text: str,
+) -> tuple[Image.Image, int, float]:
+    cropped = image_full.crop(opt_crop_bbox) if opt_crop_bbox else image_full
+    effective_target_chars = target_chars if target_chars is not None else max(len(ocr_text), 1)
+    crop_area = cropped.width * cropped.height
+    px_per_char = crop_area / max(effective_target_chars, 1)
+    if (
+        settings.crop_service.apply_crop_denoise
+        and settings.crop_service.crop_denoise_size > 1
+        and px_per_char > 1000
+    ):
+        cropped = cropped.filter(ImageFilter.MedianFilter(size=settings.crop_service.crop_denoise_size))
+    return cropped, crop_area, px_per_char
+
+
+def crop_image(
+    image_full: Image.Image,
+    *,
+    lang: str = settings.ocr.lang,
+    target_chars: Optional[int] = None,
+    debug_path: Optional[Path] = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    _log(progress_cb, "Starting OCR pipeline")
+    timing_detail: Dict[str, float] = {}
+    t0 = time.perf_counter()
+    result = _ocr_image_pil(
+        image_full,
+        lang=lang,
+        use_lighting_normalization=False,
+        timing=timing_detail,
+        timing_prefix="stage1_",
+    )
+    image_full = result["image_pil"]
+    t1 = time.perf_counter()
+    _log(progress_cb, f"First OCR complete ({len(result['words'])} words)")
+
+    words = result["words"]
+    line_words = result["line_words"]
+    correction = decide_correction(line_words)
+    image_full, words, line_words, corrected_changed = _apply_layout_correction(
+        image_full,
+        words,
+        line_words,
+        lang=lang,
+        timing_detail=timing_detail,
+    )
+    if corrected_changed:
+        _log(progress_cb, "Applied tilt/warp correction")
+    image_full, initial_crop_changed = _apply_initial_cluster_crop(image_full, words)
+    if initial_crop_changed:
+        _log(progress_cb, "Applied initial cluster crop")
+    t3 = time.perf_counter()
+
+    if corrected_changed or initial_crop_changed:
+        result = _ocr_image_pil(
+            image_full,
+            lang=lang,
+            use_lighting_normalization=False,
+            timing=timing_detail,
+            timing_prefix="stage2_",
         )
-        output_crop_path = CROPPED_DIR / f"{path.stem}_crop.png"
-        periodic_sec = time.perf_counter() - t_periodic_start
+        words = result["words"]
+        line_words = result["line_words"]
+        image_full = result["image_pil"]
+        _log(progress_cb, f"Second OCR complete ({len(words)} words)")
+    t4 = time.perf_counter()
 
-        t_io_start = time.perf_counter()
-        cropped = cropped_output
-        cropped.save(output_crop_path)
-        (OCR_TEXT_DIR / f"{path.stem}.txt").write_text(result["text"], encoding="utf-8")
-        io_sec = time.perf_counter() - t_io_start
-        total_sec = time.perf_counter() - t_total_start
+    ocr_text = strip_newlines(result["text"])
+    cluster_result2 = _cluster_bbox(words, return_cluster=True)
+    cluster_words = cluster_result2[1] if cluster_result2 else []
+    opt_crop_bbox = None
+    if cluster_words:
+        t_edge = time.perf_counter()
+        opt_crop_bbox = compute_opt_crop_bbox(cluster_words, line_words, image_full.width, image_full.height)
+        timing_detail["crop_edge_align"] = time.perf_counter() - t_edge
+        if opt_crop_bbox:
+            _log(progress_cb, "Computed final edge-aligned crop")
 
-        ocr_text = result["ocr_text"]
-        if image_type == "m":
-            quality_line = f"type={image_type} distance={levenshtein(ocr_text, target_texts['m'])}"
-        else:
-            names = ("shema", "vehaya", "kadesh", "peter")
-            distances = {name: levenshtein(ocr_text, target_texts[name]) for name in names}
-            guess_name, guess_distance = min(distances.items(), key=lambda item: item[1])
-            quality_line = f"type={image_type} guess={guess_name} distance={guess_distance}"
+    if debug_path:
+        _write_debug_overlay(debug_path, image_full, words)
+    t5 = time.perf_counter()
 
-        correction = result["correction"]
-        periodic_line = (
-            "periodic "
-            f"lag={int(periodic_meta['lag'])} "
-            f"corr={float(periodic_meta['corr']):.3f} "
-            f"peaks={int(periodic_meta['peaks'])} "
-            f"spacing_cons={float(periodic_meta['spacing_cons']):.3f} "
-            f"strength={float(periodic_meta['strength']):.3f}"
-        )
-        timing_line = _timing_report(
-            result["timing"],
-            result.get("timing_detail", {}),
-            crop_image_sec=crop_image_sec,
-            periodic_sec=periodic_sec,
-            io_sec=io_sec,
-            total_sec=total_sec,
-        )
-        print(
-            f"[{path.name}] {quality_line}\n"
-            f"  crop {cropped.width}x{cropped.height} area={result['crop_area']} "
-            f"target_chars={target_chars} px_per_char={result['px_per_char']:.1f}\n"
-            f"  correction mode={correction.mode} mean_abs={correction.mean_abs:.5f} "
-            f"std={correction.std:.5f} resid_mean={correction.resid_mean:.3f} "
-            f"resid_std={correction.resid_std:.3f} curve_std={correction.curve_std:.3f}\n"
-            f"  {periodic_line}\n"
-            f"  {timing_line}"
-        )
+    cropped, crop_area, px_per_char = _finalize_crop(
+        image_full,
+        opt_crop_bbox,
+        target_chars=target_chars,
+        ocr_text=ocr_text,
+    )
+    t6 = time.perf_counter()
+    avg_char_size = _median_char_size(words) if words else None
+    (
+        stripe_ready,
+        stripe_dark_mask,
+        stripe_mask_continuum_debug,
+        stripes_timing,
+    ) = build_post_crop_stripes(
+        cropped,
+        avg_char_size=avg_char_size,
+        fast_bg_max_dim=settings.crop_service.post_crop_stripes_fast_bg_max_dim,
+    )
+    timing_detail["post_crop_stripes_normalize"] = float(stripes_timing["post_crop_stripes_core"])
+    timing_detail["post_crop_stripes_dark_mask"] = float(
+        stripes_timing["post_crop_stripes_dark_mask_image"]
+    )
+    timing_detail["post_crop_stripes_mask_continuum_debug"] = float(
+        stripes_timing["post_crop_stripes_mask_continuum_debug"]
+    )
+    timing_detail["post_crop_stripes_ready_image"] = float(
+        stripes_timing["post_crop_stripes_ready_image"]
+    )
+    t7 = time.perf_counter()
+    _log(progress_cb, f"Done ({cropped.width}x{cropped.height})")
 
-
-if __name__ == "__main__":
-    main()
+    return {
+        "cropped": cropped,
+        "stripe_ready": stripe_ready,
+        "stripe_dark_mask": stripe_dark_mask,
+        "stripe_mask_continuum_debug": stripe_mask_continuum_debug,
+        "avg_char_size": avg_char_size,
+        "ocr_text": ocr_text,
+        "text": result["text"],
+        "correction": correction,
+        "crop_area": crop_area,
+        "px_per_char": px_per_char,
+        "timing": {
+            "ocr1": t1 - t0,
+            "crop": t3 - t1,
+            "ocr2": t4 - t3,
+            "debug": t5 - t4,
+            "crop_finalize": t6 - t5,
+            "post_crop_stripes": t7 - t6,
+            "left": 0.0,
+        },
+        "timing_detail": timing_detail,
+    }

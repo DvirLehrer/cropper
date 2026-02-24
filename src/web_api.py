@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+import time
 from io import BytesIO
 from typing import Callable, Optional
 
 from PIL import Image
 
-from output_pipeline import build_output_image_from_crop_result
-from pipeline_crop_service import crop_image
+from output import build_output_image_from_crop_result
+from cropper_pipeline import crop_image
 
 
 def crop_uploaded_image_bytes(
@@ -22,10 +23,15 @@ def crop_uploaded_image_bytes(
         image = opened.convert("RGB")
 
     result = crop_image(image, progress_cb=progress_cb)
+    t_stripes = time.perf_counter()
+    if progress_cb:
+        progress_cb("stripes_start")
     output_image, periodic_meta = build_output_image_from_crop_result(
         input_name="web-upload",
         crop_result=result,
     )
+    if progress_cb:
+        progress_cb(f"stripes {time.perf_counter() - t_stripes:.3f}s")
     out = BytesIO()
     output_image.save(out, format="JPEG", quality=95, optimize=True)
     metadata = {

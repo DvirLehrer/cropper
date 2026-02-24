@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Literal, Tuple
 
 from PIL import Image
 
-from line_structure import build_line_models
+from core.line_models import build_line_models
 
 
 @dataclass(frozen=True)

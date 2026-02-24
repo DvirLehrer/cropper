@@ -8,9 +8,8 @@ from typing import Any, Dict, List, Tuple
 
 from PIL import Image, ImageFilter, ImageOps
 import pytesseract
-from lighting_normalization import normalize_uneven_lighting
-
-OCR_CONFIG = "--psm 4"
+from config import settings
+from core.lighting import normalize_uneven_lighting
 
 
 def preprocess_image(
@@ -113,7 +112,7 @@ def ocr_image(path: Path, lang: str) -> Dict[str, Any]:
     data = pytesseract.image_to_data(
         pre,
         lang=lang,
-        config=OCR_CONFIG,
+        config=settings.ocr.tesseract_config,
         output_type=pytesseract.Output.DICT,
     )
     words = word_boxes_from_data(data)

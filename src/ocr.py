@@ -10,7 +10,7 @@ from typing import Any, Dict
 import pytesseract
 from PIL import Image
 
-from ocr_utils import preprocess_image
+from core.ocr_utils import preprocess_image
 
 
 def _tesseract_config(psm: int) -> str:
@@ -47,7 +47,7 @@ def _ocr_image_pil(
             config=_tesseract_config(4),
             output_type=pytesseract.Output.DICT,
         )
-        from ocr_utils import word_boxes_from_data, text_from_words
+        from core.ocr_utils import word_boxes_from_data, text_from_words
 
         words = word_boxes_from_data(data)
         text, line_bboxes, line_words = text_from_words(words)
@@ -110,7 +110,7 @@ def _ocr_image_pil_sparse_merge(
     )
     if timing is not None:
         timing[f"{timing_prefix}sparse_psm11"] = time.perf_counter() - t_psm11
-    from ocr_utils import word_boxes_from_data, text_from_words
+    from core.ocr_utils import word_boxes_from_data, text_from_words
 
     sparse_words = word_boxes_from_data(data)
 
