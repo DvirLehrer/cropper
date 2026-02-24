@@ -1,71 +1,97 @@
-Cropper OCR Benchmarks
+# Cropper OCR Benchmark + Web Pipeline
 
-This repo contains OCR benchmarking scripts and image assets for mezuzah scans.
+This repository contains a Hebrew OCR-based crop pipeline for mezuzah/tefillin scans, with:
+- a batch benchmark runner
+- a web upload flow
+- shared crop/output logic used by both paths
 
-Quick Start
-- Run OCR benchmark on all images:
-  - `python3 src/cropper_pipeline.py`
-- Run web app for manual upload/crop testing:
-  - `pip install -r requirements.txt`
-  - `python3 src/web_app.py`
-  - open `http://localhost:8000`
-- Deploy (Render):
-  - Push repo to GitHub
-  - In Render, create a new Blueprint service from this repo (uses `render.yaml`)
-  - Render will build using `Dockerfile` and run Gunicorn automatically
-  - For faster OCR in cloud, prefer a higher CPU instance type (OCR is CPU-bound)
-- Output folders (generated):
-  - `ocr_text/` : per-image OCR text
-  - `debug_images/` : debug overlays (overall bbox, word boxes, line boxes, edge lines)
-  - `preprocessed/` : preprocessed images used for OCR
+## Quick Start
 
-Repository Structure
-- `benchmark/` : input images
-- `text/` : canonical Hebrew texts (shema, vehaya, kadesh, peter)
-- `src/cropper_pipeline.py` : main benchmark runner
-- `src/ocr_utils.py` : shared OCR helpers (preprocess, OCR, line clustering, Levenshtein)
-- `src/edge_align_shift.py` : edge alignment sweep for crop boundaries
-- `src/line_*` : line structure, correction, and block mesh utilities
+1. Install dependencies:
+   - `pip install -r requirements.txt`
+2. Run benchmark on all images in `benchmark/`:
+   - `python3 src/benchmark_run.py`
+3. Run web app:
+   - `python3 src/web_app.py`
+   - open `http://localhost:8000`
 
-Key Behavior
-- OCR is done with Tesseract `--psm 4` on preprocessed images.
-- Text output is assembled from the same word boxes used for debug overlays.
-- Line boxes are derived via y-clustered word grouping.
+## Current Structure
 
-Goal & Strategy
-We aim to produce a precise crop of the mezuzah and tefillin text regions. The current workflow:
-- Detect the initial text area from OCR word boxes.
-- Fit line structure and optionally correct tilt/warp.
-- Estimate tight crop boundaries from edge-aligned word boxes.
+- `benchmark/`: input images
+- `text/`: canonical texts (`shema`, `vehaya`, `kadesh`, `peter`)
+- `text_type.csv`: type mapping per image
+- `src/benchmark_run.py`: batch benchmark orchestration
+- `src/cropper_pipeline.py`: single-image crop pipeline (shared core service API)
+- `src/output.py`: output rendering stage (periodic stripes post-process)
+- `src/stripes.py`: periodic stripe detection and debug light-fill output
+- `src/ocr.py`: OCR execution wrappers over Tesseract
+- `src/web_api.py`: web-facing adapter around crop/output pipeline
+- `src/web_app.py`: Flask app (HTTP/deployment envelope only)
+- `src/config.py`: single segmented configuration object (`settings`)
+- `src/core/`: internal reusable geometry/OCR/line/alignment/logging modules
 
-This is important because OCR boxes can be incomplete in shadows or noisy at the periphery. The goal is to keep the tightest crop that preserves all text.
+Generated outputs:
+- `cropped/`: final cropped images
+- `ocr_text/`: OCR text per image
+- `debug_images/`: optional debug overlays
+- `preprocessed/`: optional intermediate images
 
-Glossary
-- OCR word box: A per-word bounding box returned by Tesseract.
-- Line words: OCR word boxes grouped into a single text line by y-clustering.
-- Line box: The bounding box that encloses all words in a line.
-- Document bbox: The bounding box around detected OCR content before edge refinement.
-- Optimal lines: The tightest crop boundaries (left, top, right, bottom) that define the final crop.
-- Bottom line anomaly: When short final lines get cropped off by the optimal lines.
-- Edge alignment line: A sweep line used to align left or right edges from candidate boxes.
-- Tilt correction: A small rotation applied when OCR line baselines are slanted.
-- Warp correction: A non-linear adjustment to reduce line curvature based on OCR line structure.
+## Algorithm Flow
 
-Target Texts
-- Mezuzah uses the combined Shema + Vehaya text.
-- Tefillin uses four texts: Shema, Vehaya, Kadesh, Peter (per `text/` files).
+### 1) Batch entry (`benchmark_run.py`)
+For each image:
+1. Load image type from `text_type.csv`.
+2. Resolve expected target text from `text/`.
+3. Compute `target_chars` from newline-stripped target text.
+4. Run `crop_image(...)` from `cropper_pipeline.py`.
+5. Run output post-process (`output.py`) for periodic stripe cleanup.
+6. Save cropped image + OCR text.
+7. Compute OCR quality (Levenshtein distance) and print timing/quality report.
 
-Configurable Parameters
-Defined at the top of `src/cropper_pipeline.py`:
-- `APPLY_CROP_DENOISE` : toggle median-filter denoise on saved crops
-- `CROP_DENOISE_SIZE` : median filter kernel size
-- `ENABLE_LINE_WARP` : toggle non-linear line warp correction
-- `APPLY_LINE_CORRECTION` : toggle tilt/warp correction
+### 2) Single-image crop pipeline (`cropper_pipeline.py`)
+`crop_image(...)` executes:
+1. OCR pass 1 (`ocr._ocr_image_pil`).
+2. Line-based correction decision (`core.line_fix.decide_correction`):
+   - `none`, `tilt`, or `warp`.
+3. Apply correction when enabled:
+   - tilt via affine transform, or
+   - warp via mesh built from OCR line structure.
+4. Optional OCR pass 2 after geometry changes.
+5. Cluster OCR words and compute final crop bbox with edge alignment:
+   - `core.edge_candidates`
+   - `core.crop_alignment`
+   - `core.edge_shift`
+6. Final crop + optional denoise.
+7. Build stripe-related intermediates (`core.lighting.build_post_crop_stripes`).
+8. Return cropped image, OCR text, correction metadata, and timing details.
 
-Output Conventions
-- Hebrew output in debug or scripts is displayed reversed for readability.
-- Source files should not exceed 200 lines; split into modules as needed.
+### 3) Output post-process (`output.py` + `stripes.py`)
+1. Estimate lag bounds from average character size.
+2. Detect periodic stripe rows on the normalized stripe image.
+3. Build light debug output by filling stripe zones from surrounding statistics.
+4. Return final rendered output image + periodic metadata.
 
-Notes
-- `ocr_text/` and `debug_images/` must be regenerated after logic changes.
-- If text/boxes look misaligned, verify that `ocr_text` is built from the same OCR word boxes.
+### 4) Web path (`web_app.py` -> `web_api.py`)
+1. `web_app.py` handles upload/job lifecycle/streamed logs.
+2. `web_api.py` calls shared pipeline (`crop_image`) and output stage (`build_output_image_from_crop_result`).
+3. Returns JPEG bytes + metadata JSON.
+
+## Design Rules (Implemented)
+
+- Web app is transport/deployment only (`web_app.py`).
+- Crop/output behavior lives in reusable functions (`cropper_pipeline.py`, `output.py`, `src/core/*`).
+- CLI benchmark and web flow share the same crop/output logic.
+
+## Configuration
+
+All tunables are centralized in `src/config.py` under `settings`, segmented by domain:
+- `settings.paths`
+- `settings.ocr`
+- `settings.crop_service`
+- `settings.periodic`
+- `settings.lighting`
+
+## Deployment
+
+- `render.yaml` + `Dockerfile` are provided for Render deployment.
+- OCR is CPU-bound; higher CPU instances materially improve throughput.
