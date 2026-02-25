@@ -142,7 +142,13 @@ def _apply_transform_to_full(
         mesh_work = transform.get("mesh") or []
         mesh_full = _scale_mesh_to_full(mesh_work, work_size, full_image.size)
         if mesh_full:
-            return full_image.transform(full_image.size, Image.MESH, mesh_full, resample=Image.BICUBIC)
+            return full_image.transform(
+                full_image.size,
+                Image.MESH,
+                mesh_full,
+                resample=Image.BICUBIC,
+                fillcolor=(255, 255, 255),
+            )
     return full_image
 
 
@@ -160,7 +166,7 @@ def _apply_layout_correction(
     bool,
     Optional[Dict[str, Any]],
 ]:
-    correction = decide_correction(line_words)
+    correction = decide_correction(line_words, image_full)
     changed = False
     applied_transform: Optional[Dict[str, Any]] = None
 
@@ -172,7 +178,13 @@ def _apply_layout_correction(
             original_words = words
             original_line_words = line_words
             t_transform = time.perf_counter()
-            image_full = image_full.transform(image_full.size, Image.MESH, mesh, resample=Image.BICUBIC)
+            image_full = image_full.transform(
+                image_full.size,
+                Image.MESH,
+                mesh,
+                resample=Image.BICUBIC,
+                fillcolor=(255, 255, 255),
+            )
             timing_detail["crop_warp_transform"] = time.perf_counter() - t_transform
             warp_result = _ocr_image_pil_sparse_merge(
                 image_full,
@@ -183,7 +195,7 @@ def _apply_layout_correction(
             )
             words = warp_result["words"]
             line_words = warp_result["line_words"]
-            post = decide_correction(line_words)
+            post = decide_correction(line_words, image_full)
             if post.curve_std > correction.curve_std * 1.05 or post.resid_mean > correction.resid_mean * 1.05:
                 image_full = original_image
                 words = original_words
@@ -277,7 +289,7 @@ def crop_image(
 
     words = result["words"]
     line_words = result["line_words"]
-    correction = decide_correction(line_words)
+    correction = decide_correction(line_words, image_work)
     work_before_transform = image_work
     image_work, words, line_words, corrected_changed, applied_transform = _apply_layout_correction(
         image_work,

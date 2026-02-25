@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Tuple
+from typing import Any, Dict, List, Literal, Optional
 
 from PIL import Image
 
 from core.line_models import build_line_models
+from core.tilt_from_image import estimate_global_tilt_deg
 
 
 @dataclass(frozen=True)
@@ -20,9 +22,14 @@ class CorrectionDecision:
     resid_mean: float
     resid_std: float
     curve_std: float
+    image_angle_deg: Optional[float] = None
+    image_confidence: float = 0.0
 
 
-def decide_correction(line_words: List[List[Dict[str, Any]]]) -> CorrectionDecision:
+def decide_correction(
+    line_words: List[List[Dict[str, Any]]],
+    image: Optional[Image.Image] = None,
+) -> CorrectionDecision:
     models = build_line_models(line_words)
     slopes = [m.m for m in models]
     heights = [
@@ -69,6 +76,7 @@ def decide_correction(line_words: List[List[Dict[str, Any]]]) -> CorrectionDecis
     curve_std /= scale
 
     if len(slopes) < 2:
+        image_angle_deg, image_confidence = estimate_global_tilt_deg(image)
         return CorrectionDecision(
             mode="none",
             slope=0.0,
@@ -77,13 +85,24 @@ def decide_correction(line_words: List[List[Dict[str, Any]]]) -> CorrectionDecis
             resid_mean=resid_mean,
             resid_std=resid_std,
             curve_std=curve_std,
+            image_angle_deg=image_angle_deg,
+            image_confidence=image_confidence,
         )
     mean = sum(slopes) / len(slopes)
     mean_abs = sum(abs(s) for s in slopes) / len(slopes)
     var = sum((s - mean) ** 2 for s in slopes) / len(slopes)
     std = var ** 0.5
 
-    if mean_abs < 0.0015 and resid_mean < 0.12:
+    image_angle_deg, image_confidence = estimate_global_tilt_deg(image)
+    image_tilt = (
+        image_angle_deg is not None
+        and image_confidence >= 0.55
+        and abs(image_angle_deg) >= 0.6
+        and resid_mean <= 0.40
+    )
+    image_slope = math.tan(math.radians(image_angle_deg)) if image_angle_deg is not None else 0.0
+
+    if mean_abs < 0.0015 and resid_mean < 0.12 and not image_tilt:
         return CorrectionDecision(
             mode="none",
             slope=0.0,
@@ -92,6 +111,20 @@ def decide_correction(line_words: List[List[Dict[str, Any]]]) -> CorrectionDecis
             resid_mean=resid_mean,
             resid_std=resid_std,
             curve_std=curve_std,
+            image_angle_deg=image_angle_deg,
+            image_confidence=image_confidence,
+        )
+    if image_tilt:
+        return CorrectionDecision(
+            mode="tilt",
+            slope=image_slope,
+            mean_abs=mean_abs,
+            std=std,
+            resid_mean=resid_mean,
+            resid_std=resid_std,
+            curve_std=curve_std,
+            image_angle_deg=image_angle_deg,
+            image_confidence=image_confidence,
         )
     if mean_abs >= 0.004 and std < 0.004 and resid_mean <= 0.16 and curve_std < 0.2:
         return CorrectionDecision(
@@ -102,6 +135,8 @@ def decide_correction(line_words: List[List[Dict[str, Any]]]) -> CorrectionDecis
             resid_mean=resid_mean,
             resid_std=resid_std,
             curve_std=curve_std,
+            image_angle_deg=image_angle_deg,
+            image_confidence=image_confidence,
         )
     if curve_std >= 0.2 or resid_mean >= 0.2:
         return CorrectionDecision(
@@ -112,6 +147,8 @@ def decide_correction(line_words: List[List[Dict[str, Any]]]) -> CorrectionDecis
             resid_mean=resid_mean,
             resid_std=resid_std,
             curve_std=curve_std,
+            image_angle_deg=image_angle_deg,
+            image_confidence=image_confidence,
         )
     return CorrectionDecision(
         mode="none",
@@ -121,6 +158,8 @@ def decide_correction(line_words: List[List[Dict[str, Any]]]) -> CorrectionDecis
         resid_mean=resid_mean,
         resid_std=resid_std,
         curve_std=curve_std,
+        image_angle_deg=image_angle_deg,
+        image_confidence=image_confidence,
     )
 
 
@@ -129,21 +168,13 @@ def apply_tilt(
     words: List[Dict[str, Any]],
     slope: float,
 ) -> Image.Image:
-    if abs(slope) < 1e-6:
+    del words  # OCR is re-run after transform; word boxes are not reused.
+    angle_deg = math.degrees(math.atan(slope))
+    if abs(angle_deg) < 1e-3:
         return image
-    cx = image.width / 2.0
-    # output -> input mapping
-    a, b, c = 1.0, 0.0, 0.0
-    d, e, f = slope, 1.0, -slope * cx
-    tilted = image.transform(image.size, Image.AFFINE, (a, b, c, d, e, f), resample=Image.BICUBIC)
-
-    for w in words:
-        x1, x2 = w["x1"], w["x2"]
-        y1, y2 = w["y1"], w["y2"]
-        y1a = y1 - slope * (x1 - cx)
-        y1b = y1 - slope * (x2 - cx)
-        y2a = y2 - slope * (x1 - cx)
-        y2b = y2 - slope * (x2 - cx)
-        w["y1"] = int(round(min(y1a, y1b, y2a, y2b)))
-        w["y2"] = int(round(max(y1a, y1b, y2a, y2b)))
-    return tilted
+    return image.rotate(
+        angle_deg,
+        resample=Image.BICUBIC,
+        expand=False,
+        fillcolor=(255, 255, 255),
+    )
