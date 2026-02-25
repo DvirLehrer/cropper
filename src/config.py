@@ -31,6 +31,10 @@ class CropServiceConfig:
     apply_line_correction: bool = True
     apply_crop_denoise: bool = True
     crop_denoise_size: int = 3
+    work_max_pixels: int = int(os.environ.get("CROP_WORK_MAX_PIXELS", "2500000"))
+    post_crop_stripes_work_max_pixels: int = int(
+        os.environ.get("POST_CROP_STRIPES_WORK_MAX_PIXELS", "0")
+    )
     post_crop_stripes_fast_bg_max_dim: int = int(
         os.environ.get("POST_CROP_STRIPES_FAST_BG_MAX_DIM", "1400")
     )
@@ -40,7 +44,6 @@ class CropServiceConfig:
 class PeriodicPatternConfig:
     mask_thr: int = 250
     flat_range_max: int = 8
-    max_work_width: int = 1200
     debug_white_band_half_px: int = 5
     debug_fill_tile_size_px: int = 56
     debug_fill_sample_stride_px: int = 4

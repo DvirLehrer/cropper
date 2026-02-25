@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
+import math
 import time
-from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageFilter
 
 from config import settings
 from core.lighting import (
@@ -28,6 +28,124 @@ def _log(progress_cb: Optional[Callable[[str], None]], message: str) -> None:
         progress_cb(message)
 
 
+def _work_scale_for_image(width: int, height: int, max_pixels: int) -> float:
+    area = width * height
+    if max_pixels <= 0 or area <= max_pixels:
+        return 1.0
+    return (float(max_pixels) / float(area)) ** 0.5
+
+
+def _downscale_for_work(image: Image.Image, scale: float) -> Image.Image:
+    if scale >= 1.0:
+        return image
+    out_w = max(1, int(round(image.width * scale)))
+    out_h = max(1, int(round(image.height * scale)))
+    return image.resize((out_w, out_h), Image.Resampling.LANCZOS)
+
+
+def _sync_full_orientation_after_ocr(
+    full_image: Image.Image,
+    work_before_ocr: Image.Image,
+    work_after_ocr: Image.Image,
+) -> tuple[Image.Image, Image.Image]:
+    if work_after_ocr.size == work_before_ocr.size:
+        return full_image, work_after_ocr
+    if work_after_ocr.size == (work_before_ocr.height, work_before_ocr.width):
+        return full_image.rotate(90, expand=True), work_after_ocr
+    return full_image, work_after_ocr
+
+
+def _map_bbox_to_full(
+    work_bbox: Tuple[int, int, int, int],
+    work_size: Tuple[int, int],
+    full_size: Tuple[int, int],
+) -> Optional[Tuple[int, int, int, int]]:
+    work_w, work_h = work_size
+    full_w, full_h = full_size
+    if work_w <= 0 or work_h <= 0:
+        return None
+    x1, y1, x2, y2 = work_bbox
+    sx = float(full_w) / float(work_w)
+    sy = float(full_h) / float(work_h)
+    full_bbox = (
+        int(math.floor(x1 * sx)),
+        int(math.floor(y1 * sy)),
+        int(math.ceil(x2 * sx)),
+        int(math.ceil(y2 * sy)),
+    )
+    return _clamp_bbox(full_bbox, full_w, full_h)
+
+
+def _scale_mesh_to_full(
+    mesh_work: list[
+        tuple[
+            tuple[int, int, int, int],
+            tuple[float, float, float, float, float, float, float, float],
+        ]
+    ],
+    work_size: Tuple[int, int],
+    full_size: Tuple[int, int],
+) -> list[
+    tuple[
+        tuple[int, int, int, int],
+        tuple[float, float, float, float, float, float, float, float],
+    ]
+]:
+    work_w, work_h = work_size
+    full_w, full_h = full_size
+    if work_w <= 1 or work_h <= 1:
+        return []
+    sx = float(full_w - 1) / float(work_w - 1)
+    sy = float(full_h - 1) / float(work_h - 1)
+
+    def _x(v: float) -> float:
+        return v * sx
+
+    def _y(v: float) -> float:
+        return v * sy
+
+    mesh_full = []
+    for quad, src in mesh_work:
+        qx0 = int(round(_x(quad[0])))
+        qy0 = int(round(_y(quad[1])))
+        qx1 = int(round(_x(quad[2])))
+        qy1 = int(round(_y(quad[3])))
+        qx0 = max(0, min(full_w - 1, qx0))
+        qx1 = max(0, min(full_w - 1, qx1))
+        qy0 = max(0, min(full_h - 1, qy0))
+        qy1 = max(0, min(full_h - 1, qy1))
+        if qx1 <= qx0 or qy1 <= qy0:
+            continue
+        scaled_src = (
+            _x(src[0]),
+            _y(src[1]),
+            _x(src[2]),
+            _y(src[3]),
+            _x(src[4]),
+            _y(src[5]),
+            _x(src[6]),
+            _y(src[7]),
+        )
+        mesh_full.append(((qx0, qy0, qx1, qy1), scaled_src))
+    return mesh_full
+
+
+def _apply_transform_to_full(
+    full_image: Image.Image,
+    transform: Dict[str, Any],
+    work_size: Tuple[int, int],
+) -> Image.Image:
+    mode = transform.get("mode")
+    if mode == "tilt":
+        return apply_tilt(full_image, [], float(transform["slope"]))
+    if mode == "warp":
+        mesh_work = transform.get("mesh") or []
+        mesh_full = _scale_mesh_to_full(mesh_work, work_size, full_image.size)
+        if mesh_full:
+            return full_image.transform(full_image.size, Image.MESH, mesh_full, resample=Image.BICUBIC)
+    return full_image
+
+
 def _apply_layout_correction(
     image_full: Image.Image,
     words: list[dict[str, Any]],
@@ -35,9 +153,16 @@ def _apply_layout_correction(
     *,
     lang: str,
     timing_detail: Dict[str, float],
-) -> tuple[Image.Image, list[dict[str, Any]], list[list[dict[str, Any]]], bool]:
+) -> tuple[
+    Image.Image,
+    list[dict[str, Any]],
+    list[list[dict[str, Any]]],
+    bool,
+    Optional[Dict[str, Any]],
+]:
     correction = decide_correction(line_words)
     changed = False
+    applied_transform: Optional[Dict[str, Any]] = None
 
     if settings.crop_service.enable_line_warp and settings.crop_service.apply_line_correction and correction.mode == "warp":
         xs, ys, grid = build_block_mesh_from_lines(line_words, image_full.width, image_full.height, grid_step=80)
@@ -65,6 +190,7 @@ def _apply_layout_correction(
                 line_words = original_line_words
             else:
                 changed = True
+                applied_transform = {"mode": "warp", "mesh": mesh}
     elif settings.crop_service.enable_line_warp and settings.crop_service.apply_line_correction and correction.mode == "tilt":
         t_tilt = time.perf_counter()
         image_full = apply_tilt(image_full, words, correction.slope)
@@ -79,29 +205,22 @@ def _apply_layout_correction(
         words = tilt_result["words"]
         line_words = tilt_result["line_words"]
         changed = True
+        applied_transform = {"mode": "tilt", "slope": correction.slope}
 
-    return image_full, words, line_words, changed
+    return image_full, words, line_words, changed, applied_transform
 
 
 def _apply_initial_cluster_crop(
     image_full: Image.Image,
     words: list[dict[str, Any]],
-) -> tuple[Image.Image, bool]:
+) -> tuple[Image.Image, bool, Optional[Tuple[int, int, int, int]]]:
     cluster_result = _cluster_bbox(words, return_cluster=True)
     if not cluster_result:
-        return image_full, False
+        return image_full, False, None
     crop_bbox = _clamp_bbox(cluster_result[0], image_full.width, image_full.height)
     if not crop_bbox:
-        return image_full, False
-    return image_full.crop(crop_bbox), True
-
-
-def _write_debug_overlay(debug_path: Path, image_full: Image.Image, words: list[dict[str, Any]]) -> None:
-    debug_image = image_full.copy()
-    draw = ImageDraw.Draw(debug_image)
-    for w in words:
-        draw.rectangle([w["x1"], w["y1"], w["x2"], w["y2"]], outline=(0, 200, 0), width=2)
-    debug_image.save(debug_path)
+        return image_full, False, None
+    return image_full.crop(crop_bbox), True, crop_bbox
 
 
 def _finalize_crop(
@@ -129,51 +248,74 @@ def crop_image(
     *,
     lang: str = settings.ocr.lang,
     target_chars: Optional[int] = None,
-    debug_path: Optional[Path] = None,
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     _log(progress_cb, "Starting OCR pipeline")
     timing_detail: Dict[str, float] = {}
+    full_current = image_full
+    work_scale = _work_scale_for_image(
+        full_current.width,
+        full_current.height,
+        settings.crop_service.work_max_pixels,
+    )
+    image_work = _downscale_for_work(full_current, work_scale)
     t0 = time.perf_counter()
     result = _ocr_image_pil(
-        image_full,
+        image_work,
         lang=lang,
         use_lighting_normalization=False,
         timing=timing_detail,
         timing_prefix="stage1_",
     )
-    image_full = result["image_pil"]
+    full_current, image_work = _sync_full_orientation_after_ocr(
+        full_current,
+        image_work,
+        result["image_pil"],
+    )
     t1 = time.perf_counter()
     _log(progress_cb, f"First OCR complete ({len(result['words'])} words)")
 
     words = result["words"]
     line_words = result["line_words"]
     correction = decide_correction(line_words)
-    image_full, words, line_words, corrected_changed = _apply_layout_correction(
-        image_full,
+    work_before_transform = image_work
+    image_work, words, line_words, corrected_changed, applied_transform = _apply_layout_correction(
+        image_work,
         words,
         line_words,
         lang=lang,
         timing_detail=timing_detail,
     )
+    if corrected_changed and applied_transform:
+        full_current = _apply_transform_to_full(full_current, applied_transform, work_before_transform.size)
     if corrected_changed:
         _log(progress_cb, "Applied tilt/warp correction")
-    image_full, initial_crop_changed = _apply_initial_cluster_crop(image_full, words)
+    work_before_crop = image_work
+    image_work, initial_crop_changed, initial_crop_bbox = _apply_initial_cluster_crop(image_work, words)
+    if initial_crop_changed and initial_crop_bbox:
+        full_crop_bbox = _map_bbox_to_full(initial_crop_bbox, work_before_crop.size, full_current.size)
+        if full_crop_bbox:
+            full_current = full_current.crop(full_crop_bbox)
     if initial_crop_changed:
         _log(progress_cb, "Applied initial cluster crop")
     t3 = time.perf_counter()
 
     if corrected_changed or initial_crop_changed:
+        work_before_stage2 = image_work
         result = _ocr_image_pil(
-            image_full,
+            image_work,
             lang=lang,
             use_lighting_normalization=False,
             timing=timing_detail,
             timing_prefix="stage2_",
         )
+        full_current, image_work = _sync_full_orientation_after_ocr(
+            full_current,
+            work_before_stage2,
+            result["image_pil"],
+        )
         words = result["words"]
         line_words = result["line_words"]
-        image_full = result["image_pil"]
         _log(progress_cb, f"Second OCR complete ({len(words)} words)")
     t4 = time.perf_counter()
 
@@ -183,25 +325,23 @@ def crop_image(
     opt_crop_bbox = None
     if cluster_words:
         t_edge = time.perf_counter()
-        opt_crop_bbox = compute_opt_crop_bbox(cluster_words, line_words, image_full.width, image_full.height)
+        opt_crop_bbox = compute_opt_crop_bbox(cluster_words, line_words, image_work.width, image_work.height)
         timing_detail["crop_edge_align"] = time.perf_counter() - t_edge
         if opt_crop_bbox:
             _log(progress_cb, "Computed final edge-aligned crop")
-
-    if debug_path:
-        _write_debug_overlay(debug_path, image_full, words)
-    t5 = time.perf_counter()
+    full_opt_crop_bbox = None
+    if opt_crop_bbox:
+        full_opt_crop_bbox = _map_bbox_to_full(opt_crop_bbox, image_work.size, full_current.size)
 
     cropped, crop_area, px_per_char = _finalize_crop(
-        image_full,
-        opt_crop_bbox,
+        full_current,
+        full_opt_crop_bbox,
         target_chars=target_chars,
         ocr_text=ocr_text,
     )
     t6 = time.perf_counter()
     avg_char_size = _median_char_size(words) if words else None
     (
-        stripe_ready,
         stripe_dark_mask,
         stripe_mask_continuum_debug,
         stripes_timing,
@@ -217,15 +357,12 @@ def crop_image(
     timing_detail["post_crop_stripes_mask_continuum_debug"] = float(
         stripes_timing["post_crop_stripes_mask_continuum_debug"]
     )
-    timing_detail["post_crop_stripes_ready_image"] = float(
-        stripes_timing["post_crop_stripes_ready_image"]
-    )
     t7 = time.perf_counter()
     _log(progress_cb, f"Done ({cropped.width}x{cropped.height})")
 
     return {
         "cropped": cropped,
-        "stripe_ready": stripe_ready,
+        "stripe_ready": cropped,
         "stripe_dark_mask": stripe_dark_mask,
         "stripe_mask_continuum_debug": stripe_mask_continuum_debug,
         "avg_char_size": avg_char_size,
@@ -238,8 +375,8 @@ def crop_image(
             "ocr1": t1 - t0,
             "crop": t3 - t1,
             "ocr2": t4 - t3,
-            "debug": t5 - t4,
-            "crop_finalize": t6 - t5,
+            "debug": 0.0,
+            "crop_finalize": t6 - t4,
             "post_crop_stripes": t7 - t6,
             "left": 0.0,
         },

@@ -8,6 +8,7 @@ from pathlib import Path
 import time
 from typing import Optional
 
+import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 from config import settings
 
@@ -32,13 +33,11 @@ def _sobel_abs(gray: Image.Image, kernel: tuple[int, ...]) -> Image.Image:
 def _line_energy(gray: Image.Image) -> list[int]:
     dy = _sobel_abs(gray, (-1, -2, -1, 0, 0, 0, 1, 2, 1))
     dx = _sobel_abs(gray, (-1, 0, 1, -2, 0, 2, -1, 0, 1))
-    pdy = list(dy.getdata())
-    pdx = list(dx.getdata())
-    out: list[int] = []
-    for a, b in zip(pdy, pdx):
-        v = int(round(a - 0.45 * b))
-        out.append(0 if v < 0 else v)
-    return out
+    pdy = np.asarray(dy, dtype=np.float32).ravel()
+    pdx = np.asarray(dx, dtype=np.float32).ravel()
+    out = np.rint(pdy - (0.45 * pdx))
+    out = np.clip(out, 0.0, None).astype(np.int32)
+    return out.tolist()
 
 
 def _percentile(vals: list[int], q: float) -> int:
@@ -50,69 +49,63 @@ def _percentile(vals: list[int], q: float) -> int:
 
 
 def _row_signal(binary: list[int], valid: list[bool], w: int, h: int) -> list[float]:
-    sig = [0.0] * h
-    for y in range(h):
-        s = y * w
-        num = 0
-        den = 0
-        for x in range(w):
-            i = s + x
-            if not valid[i]:
-                continue
-            den += 1
-            if binary[i]:
-                num += 1
-        sig[y] = (num / den) if den else 0.0
-    return sig
+    b = np.asarray(binary, dtype=np.uint8).reshape((h, w))
+    v = np.asarray(valid, dtype=np.bool_).reshape((h, w))
+    den = v.sum(axis=1).astype(np.float64)
+    num = (b.astype(np.float64) * v.astype(np.float64)).sum(axis=1)
+    out = np.zeros(h, dtype=np.float64)
+    ok = den > 0
+    out[ok] = num[ok] / den[ok]
+    return out.tolist()
 
 
 def _dark_ridge_row_signal(gray: Image.Image, valid: list[bool], w: int, h: int) -> list[float]:
-    px = list(gray.getdata())
-    sig = [0.0] * h
     if w < 3 or h < 3:
-        return sig
+        return [0.0] * h
 
-    for y in range(1, h - 1):
-        row = y * w
-        acc = 0.0
-        den = 0
-        for x in range(1, w - 1):
-            i = row + x
-            if not valid[i]:
-                continue
-            iu = i - w
-            idn = i + w
-            if not valid[iu] or not valid[idn]:
-                continue
-            top = float(px[iu])
-            mid = float(px[i])
-            bot = float(px[idn])
-            ridge = 0.5 * (top + bot) - mid
-            if ridge <= 0.0:
-                continue
-            lr = abs(float(px[i + 1]) - float(px[i - 1]))
-            v = ridge - 0.35 * lr
-            if v <= 0.0:
-                continue
-            acc += v
-            den += 1
-        sig[y] = (acc / float(den)) if den else 0.0
+    px = np.asarray(gray, dtype=np.float32).reshape((h, w))
+    v = np.asarray(valid, dtype=np.bool_).reshape((h, w))
+    center = px[1:-1, 1:-1]
+    top = px[:-2, 1:-1]
+    bot = px[2:, 1:-1]
+    left = px[1:-1, :-2]
+    right = px[1:-1, 2:]
 
-    vals = [v for v in sig if v > 0.0]
-    if not vals:
-        return sig
-    p95 = sorted(vals)[int(round(0.95 * (len(vals) - 1)))]
-    scale = p95 if p95 > 1e-6 else max(vals)
+    v_center = v[1:-1, 1:-1]
+    v_top = v[:-2, 1:-1]
+    v_bot = v[2:, 1:-1]
+    valid_triplet = v_center & v_top & v_bot
+
+    ridge = 0.5 * (top + bot) - center
+    lr = np.abs(right - left)
+    score = ridge - 0.35 * lr
+    score = np.where((valid_triplet) & (ridge > 0.0) & (score > 0.0), score, 0.0)
+
+    den = (score > 0.0).sum(axis=1).astype(np.float64)
+    acc = score.sum(axis=1, dtype=np.float64)
+    mid_rows = np.zeros(h - 2, dtype=np.float64)
+    ok = den > 0
+    mid_rows[ok] = acc[ok] / den[ok]
+
+    sig = np.zeros(h, dtype=np.float64)
+    sig[1:-1] = mid_rows
+
+    pos = sig[sig > 0.0]
+    if pos.size == 0:
+        return sig.tolist()
+    p95 = float(np.percentile(pos, 95))
+    scale = p95 if p95 > 1e-6 else float(pos.max())
     if scale <= 1e-6:
-        return sig
-    out = [min(1.0, v / scale) for v in sig]
+        return sig.tolist()
+    out = np.minimum(1.0, sig / scale)
 
-    sm = [0.0] * h
-    for y in range(h):
-        y0 = max(0, y - 1)
-        y1 = min(h - 1, y + 1)
-        sm[y] = sum(out[y0 : y1 + 1]) / float(y1 - y0 + 1)
-    return sm
+    sm = out.copy()
+    if h >= 2:
+        sm[0] = 0.5 * (out[0] + out[1])
+        sm[-1] = 0.5 * (out[-2] + out[-1])
+    if h >= 3:
+        sm[1:-1] = (out[:-2] + out[1:-1] + out[2:]) / 3.0
+    return sm.tolist()
 
 
 def _row_signal_xrange(
@@ -127,20 +120,14 @@ def _row_signal_xrange(
     xb = max(0, min(w - 1, x1))
     if xb < xa:
         xa, xb = xb, xa
-    sig = [0.0] * h
-    for y in range(h):
-        s = y * w
-        num = 0
-        den = 0
-        for x in range(xa, xb + 1):
-            i = s + x
-            if not valid[i]:
-                continue
-            den += 1
-            if binary[i]:
-                num += 1
-        sig[y] = (num / den) if den else 0.0
-    return sig
+    b = np.asarray(binary, dtype=np.uint8).reshape((h, w))[:, xa : xb + 1]
+    v = np.asarray(valid, dtype=np.bool_).reshape((h, w))[:, xa : xb + 1]
+    den = v.sum(axis=1).astype(np.float64)
+    num = (b.astype(np.float64) * v.astype(np.float64)).sum(axis=1)
+    out = np.zeros(h, dtype=np.float64)
+    ok = den > 0
+    out[ok] = num[ok] / den[ok]
+    return out.tolist()
 
 
 def _binary_from_local_thresholds(
@@ -154,29 +141,24 @@ def _binary_from_local_thresholds(
 ) -> list[int]:
     block_w = max(24, block_w)
     blocks = list(range(0, w, block_w))
-    thrs: list[int] = []
+    energy_arr = np.asarray(energy, dtype=np.int32).reshape((h, w))
+    valid_arr = np.asarray(valid, dtype=np.bool_).reshape((h, w))
+    out = np.zeros((h, w), dtype=np.uint8)
+
     for x0 in blocks:
         x1 = min(w, x0 + block_w)
-        vals: list[int] = []
-        for y in range(h):
-            row = y * w
-            for x in range(x0, x1):
-                i = row + x
-                if valid[i]:
-                    vals.append(energy[i])
-        thrs.append(_percentile(vals, q) if vals else 255)
+        e_blk = energy_arr[:, x0:x1]
+        v_blk = valid_arr[:, x0:x1]
+        vals = e_blk[v_blk]
+        if vals.size == 0:
+            thr = 255
+        else:
+            k = int(round(max(0.0, min(1.0, q)) * (vals.size - 1)))
+            # Equivalent order statistic to sorted(vals)[k], faster than full Python loops.
+            thr = int(np.partition(vals, k)[k])
+        out[:, x0:x1][v_blk & (e_blk >= thr)] = 1
 
-    out = [0] * (w * h)
-    for bi, x0 in enumerate(blocks):
-        x1 = min(w, x0 + block_w)
-        thr = thrs[bi]
-        for y in range(h):
-            row = y * w
-            for x in range(x0, x1):
-                i = row + x
-                if valid[i] and energy[i] >= thr:
-                    out[i] = 1
-    return out
+    return out.ravel().tolist()
 
 
 def _autocorr_best(
@@ -187,8 +169,8 @@ def _autocorr_best(
     min_lag: Optional[int] = None,
     max_lag: Optional[int] = None,
 ) -> tuple[int, float]:
-    seg = sig[y_lo : y_hi + 1]
-    n = len(seg)
+    seg = np.asarray(sig[y_lo : y_hi + 1], dtype=np.float64)
+    n = int(seg.size)
     if n < 24:
         return 0, 0.0
     lag_lo = max(6, n // 40)
@@ -202,13 +184,11 @@ def _autocorr_best(
     best_lag = 0
     best_corr = 0.0
     for lag in range(lag_lo, lag_hi + 1):
-        sxy = sx2 = sy2 = 0.0
-        for i in range(0, n - lag):
-            a = seg[i]
-            b = seg[i + lag]
-            sxy += a * b
-            sx2 += a * a
-            sy2 += b * b
+        a = seg[: n - lag]
+        b = seg[lag:]
+        sxy = float(np.dot(a, b))
+        sx2 = float(np.dot(a, a))
+        sy2 = float(np.dot(b, b))
         den = (sx2 * sy2) ** 0.5
         if den <= 1e-9:
             continue
@@ -222,17 +202,15 @@ def _autocorr_best(
 def _autocorr_at_lag(sig: list[float], y_lo: int, y_hi: int, lag: int) -> float:
     if lag <= 0:
         return 0.0
-    seg = sig[y_lo : y_hi + 1]
-    n = len(seg)
+    seg = np.asarray(sig[y_lo : y_hi + 1], dtype=np.float64)
+    n = int(seg.size)
     if lag >= n:
         return 0.0
-    sxy = sx2 = sy2 = 0.0
-    for i in range(0, n - lag):
-        a = seg[i]
-        b = seg[i + lag]
-        sxy += a * b
-        sx2 += a * a
-        sy2 += b * b
+    a = seg[: n - lag]
+    b = seg[lag:]
+    sxy = float(np.dot(a, b))
+    sx2 = float(np.dot(a, a))
+    sy2 = float(np.dot(b, b))
     den = (sx2 * sy2) ** 0.5
     if den <= 1e-9:
         return 0.0
@@ -536,9 +514,10 @@ def _two_segment_from_intervals(
 
 def _work_image(gray_full: Image.Image) -> tuple[Image.Image, float]:
     w, h = gray_full.size
-    if w <= settings.periodic.max_work_width:
+    max_pixels = settings.crop_service.work_max_pixels
+    if max_pixels <= 0 or (w * h) <= max_pixels:
         return gray_full, 1.0
-    scale = settings.periodic.max_work_width / float(max(1, w))
+    scale = (max_pixels / float(max(1, w * h))) ** 0.5
     new_w = max(1, int(round(w * scale)))
     new_h = max(1, int(round(h * scale)))
     return gray_full.resize((new_w, new_h), Image.BILINEAR), scale
