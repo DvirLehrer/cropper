@@ -120,6 +120,7 @@ INDEX_HTML = """<!doctype html>
         const HIDDEN_SPAN_LABELS = new Set(["job_queued", "job_started"]);
 
         const es = new EventSource(`/api/jobs/${jobId}/events`);
+        let logStreamDisconnected = false;
         await new Promise((resolve, reject) => {
           es.onmessage = (ev) => {
             try {
@@ -159,11 +160,22 @@ INDEX_HTML = """<!doctype html>
           };
           es.onerror = () => {
             es.close();
-            reject(new Error("נותק חיבור הלוגים לשרת"));
+            logStreamDisconnected = true;
+            timingBox.textContent += "log_stream_disconnected_fallback_to_result_polling\\n";
+            resolve();
           };
         });
 
-        const res = await fetch(`/api/jobs/${jobId}/result`);
+        let res = await fetch(`/api/jobs/${jobId}/result`);
+        if (res.status === 425 && logStreamDisconnected) {
+          const MAX_RESULT_POLL_ATTEMPTS = 360;
+          const RESULT_POLL_INTERVAL_MS = 1000;
+          for (let i = 0; i < MAX_RESULT_POLL_ATTEMPTS; i++) {
+            await new Promise((r) => setTimeout(r, RESULT_POLL_INTERVAL_MS));
+            res = await fetch(`/api/jobs/${jobId}/result`);
+            if (res.status !== 425) break;
+          }
+        }
         if (!res.ok) {
           const contentType = res.headers.get("content-type") || "";
           let message = `שגיאת שרת (${res.status})`;
@@ -294,7 +306,15 @@ def crop_job_events(job_id: str):
             yield ": keepalive\n\n"
             time.sleep(0.4)
 
-    return Response(stream_with_context(event_stream()), mimetype="text/event-stream")
+    return Response(
+        stream_with_context(event_stream()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/api/jobs/<job_id>/result")
