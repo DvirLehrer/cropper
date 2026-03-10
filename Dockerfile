@@ -56,4 +56,4 @@ COPY text_type.csv ./text_type.csv
 ENV PORT=8000
 EXPOSE 8000
 
-CMD ["sh", "-c", "gunicorn --chdir src --workers 1 --worker-tmp-dir /dev/shm --timeout 240 --graceful-timeout 30 --bind 0.0.0.0:${PORT} web_app:app"]
+CMD ["sh", "-c", "gunicorn --chdir src --workers 1 --worker-class gthread --threads 8 --worker-tmp-dir /dev/shm --timeout 240 --graceful-timeout 30 --bind 0.0.0.0:${PORT} web_app:app"]
