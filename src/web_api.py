@@ -26,14 +26,28 @@ def crop_uploaded_image_bytes(
     t_stripes = time.perf_counter()
     if progress_cb:
         progress_cb("stripes_start")
-    output_image, periodic_meta = build_output_image_from_crop_result(
-        input_name="web-upload",
-        crop_result=result,
-    )
+    try:
+        output_image, periodic_meta = build_output_image_from_crop_result(
+            input_name="web-upload",
+            crop_result=result,
+        )
+    except Exception as exc:
+        output_image = result["cropped"].copy()
+        periodic_meta = {"fallback_reason": str(exc), "light_debug_output": False}
+        if progress_cb:
+            progress_cb(f"stripes_fallback {exc}")
     if progress_cb:
         progress_cb(f"stripes {time.perf_counter() - t_stripes:.3f}s")
     out = BytesIO()
-    output_image.save(out, format="JPEG", quality=95, optimize=True)
+    if progress_cb:
+        progress_cb("jpeg_start")
+    try:
+        output_image.save(out, format="JPEG", quality=95, optimize=True)
+    except Exception as exc:
+        out = BytesIO()
+        output_image.save(out, format="JPEG", quality=90, optimize=False)
+        if progress_cb:
+            progress_cb(f"jpeg_fallback {exc}")
     metadata = {
         "timing": result["timing"],
         "timing_detail": result.get("timing_detail", {}),

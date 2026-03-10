@@ -353,22 +353,30 @@ def crop_image(
     )
     t6 = time.perf_counter()
     avg_char_size = _median_char_size(words) if words else None
-    (
-        stripe_dark_mask,
-        stripe_mask_continuum_debug,
-        stripes_timing,
-    ) = build_post_crop_stripes(
-        cropped,
-        avg_char_size=avg_char_size,
-        fast_bg_max_dim=settings.crop_service.post_crop_stripes_fast_bg_max_dim,
-    )
-    timing_detail["post_crop_stripes_normalize"] = float(stripes_timing["post_crop_stripes_core"])
-    timing_detail["post_crop_stripes_dark_mask"] = float(
-        stripes_timing["post_crop_stripes_dark_mask_image"]
-    )
-    timing_detail["post_crop_stripes_mask_continuum_debug"] = float(
-        stripes_timing["post_crop_stripes_mask_continuum_debug"]
-    )
+    try:
+        (
+            stripe_dark_mask,
+            stripe_mask_continuum_debug,
+            stripes_timing,
+        ) = build_post_crop_stripes(
+            cropped,
+            avg_char_size=avg_char_size,
+            fast_bg_max_dim=settings.crop_service.post_crop_stripes_fast_bg_max_dim,
+        )
+        timing_detail["post_crop_stripes_normalize"] = float(stripes_timing["post_crop_stripes_core"])
+        timing_detail["post_crop_stripes_dark_mask"] = float(
+            stripes_timing["post_crop_stripes_dark_mask_image"]
+        )
+        timing_detail["post_crop_stripes_mask_continuum_debug"] = float(
+            stripes_timing["post_crop_stripes_mask_continuum_debug"]
+        )
+    except Exception as exc:
+        stripe_dark_mask = Image.new("L", cropped.size, 0)
+        stripe_mask_continuum_debug = Image.new("L", cropped.size, 0)
+        timing_detail["post_crop_stripes_normalize"] = 0.0
+        timing_detail["post_crop_stripes_dark_mask"] = 0.0
+        timing_detail["post_crop_stripes_mask_continuum_debug"] = 0.0
+        _log(progress_cb, f"Post-crop stripes fallback ({exc})")
     t7 = time.perf_counter()
     _log(progress_cb, f"Done ({cropped.width}x{cropped.height})")
 
