@@ -7,6 +7,7 @@ def detect_text(
     output_dir: str = "test_output",
     padding_frac: float = 0.20,
     min_size: int = 6,
+    max_pixels: int = 1_000_000,
 ):
     """Detects text in the file."""
     from google.cloud import vision
@@ -129,11 +130,29 @@ def detect_text(
 
         return written
 
+    # Downscale large images before sending to Vision (faster upload + processing,
+    # no measurable box-count loss at ~1MP). We OCR the smaller image but scale the
+    # returned vertices back to the ORIGINAL frame (via inv_scale below), so
+    # char_boxes.json -- and every internal overlay/warp, which read the original
+    # `path` -- all stay in one coordinate frame regardless of downscaling.
+    scale = 1.0
+    raw = cv2.imread(path, cv2.IMREAD_IGNORE_ORIENTATION | cv2.IMREAD_COLOR) if max_pixels else None
+    if raw is not None and raw.shape[0] * raw.shape[1] > max_pixels:
+        h, w = raw.shape[:2]
+        scale = (max_pixels / (h * w)) ** 0.5
+        small = cv2.resize(raw, (max(1, round(w * scale)), max(1, round(h * scale))),
+                           interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(os.path.splitext(path)[1] or ".jpg", small)
+        if not ok:
+            raise RuntimeError(f"failed to encode downscaled image for {path}")
+        content = buf.tobytes()
+        print(f"Downscaled {w}x{h} -> {small.shape[1]}x{small.shape[0]} (<= {max_pixels} px) for OCR")
+    else:
+        with open(path, "rb") as image_file:
+            content = image_file.read()
+    inv_scale = 1.0 / scale
+
     client = vision.ImageAnnotatorClient()
-
-    with open(path, "rb") as image_file:
-        content = image_file.read()
-
     image = vision.Image(content=content)
 
     # NOTE: `text_detection` mostly yields word-ish boxes via `text_annotations`.
@@ -161,14 +180,15 @@ def detect_text(
     hebrew_text_count = 0
 
     def _norm_vertex(v):
-        # Vision sometimes returns None for x/y; normalize to ints.
-        x = 0 if v.x is None else int(v.x)
-        y = 0 if v.y is None else int(v.y)
+        # Vision sometimes returns None for x/y; normalize to ints and scale back
+        # to the original frame (inv_scale == 1.0 when no downscaling happened).
+        x = 0 if v.x is None else int(round(v.x * inv_scale))
+        y = 0 if v.y is None else int(round(v.y * inv_scale))
         return {"x": x, "y": y}
 
     def _bbox_minmax(vertices):
-        xs = [0 if v.x is None else int(v.x) for v in vertices]
-        ys = [0 if v.y is None else int(v.y) for v in vertices]
+        xs = [0 if v.x is None else int(round(v.x * inv_scale)) for v in vertices]
+        ys = [0 if v.y is None else int(round(v.y * inv_scale)) for v in vertices]
         return min(xs), max(xs), min(ys), max(ys)
 
     # Extract character-level (symbol) boxes.
@@ -507,6 +527,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--padding-frac", type=float, default=0.20, help="Padding as fraction of char box size (e.g. 0.2 = 20%).")
     parser.add_argument("--min-size", type=int, default=6, help="Skip crops with width/height smaller than this (px).")
+    parser.add_argument("--max-pixels", type=int, default=1_000_000,
+                        help="Downscale images so total pixels <= this before OCR (0 = no downscale).")
     args = parser.parse_args()
 
     if not args.image and not args.test_set and not args.images_dir:
@@ -555,6 +577,7 @@ if __name__ == "__main__":
                 output_dir=out_dir,
                 padding_frac=float(args.padding_frac),
                 min_size=int(args.min_size),
+                max_pixels=int(args.max_pixels),
             )
             if output_path:
                 print(f"✓ Successfully processed: {output_path}")

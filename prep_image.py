@@ -162,12 +162,22 @@ def mask_and_crop(img: np.ndarray, polygon: np.ndarray, fill: int = 255):
 
 
 # ---- pipeline -------------------------------------------------------------
-def run_pipeline(image_path: str, json_path: str, out_dir: str):
+def run_pipeline(image_path: str, json_path: str, out_dir: str, max_pixels: int = 1_000_000):
     img = imread_boxframe(image_path)
     if img is None:
         raise SystemExit(f"Could not read image: {image_path}")
     boxes, chars, hebrew = load_boxes(json_path)
     print(f"Loaded {len(boxes)} boxes ({int(hebrew.sum())} Hebrew) from {json_path}")
+
+    # Optionally downscale to cap total pixels (big speedup on multi-MP photos).
+    # Boxes live in the full-res frame, so scale them by the same factor.
+    h, w = img.shape[:2]
+    if max_pixels and h * w > max_pixels:
+        scale = (max_pixels / (h * w)) ** 0.5
+        img = cv2.resize(img, (max(1, round(w * scale)), max(1, round(h * scale))),
+                         interpolation=cv2.INTER_AREA)
+        boxes = boxes * scale
+        print(f"  downscaled {w}x{h} -> {img.shape[1]}x{img.shape[0]} (scale {scale:.3f})")
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -213,6 +223,8 @@ def main():
                     help="Debug output root; images go to <out-dir>/<base>/.")
     ap.add_argument("--run-ocr", action="store_true",
                     help="If the boxes JSON is missing, run google_ocr.detect_text to create it (needs Vision creds).")
+    ap.add_argument("--max-pixels", type=int, default=1_000_000,
+                    help="Downscale the image so total pixels <= this before processing (0 = no downscale).")
     args = ap.parse_args()
 
     base = os.path.splitext(os.path.basename(args.image))[0]
@@ -231,7 +243,7 @@ def main():
             )
 
     out_dir = os.path.join(args.out_dir, base)
-    run_pipeline(args.image, json_path, out_dir)
+    run_pipeline(args.image, json_path, out_dir, max_pixels=args.max_pixels)
 
 
 if __name__ == "__main__":
