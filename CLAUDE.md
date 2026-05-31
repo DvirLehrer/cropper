@@ -4,66 +4,87 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project purpose
 
-Hebrew character recognition pipeline for STaM (Sefer Torah, Tefillin, Mezuzah) imagery. Four standalone Python scripts wired together by a shared on-disk layout under `test_output/` — no package, no requirements file, no tests.
+Image **pre-processing** for STaM (Sefer Torah, Tefillin, Mezuzah) imagery: take a photo/scan of
+parchment text and produce an orientation-corrected, tightly-cropped image to feed to a
+downstream analysis system. Two standalone Python scripts wired together by files on disk under
+`test_output/` — no package, no requirements file, no tests.
+
+(An earlier CNN-classification branch — `export_coco_from_ocr.py`, `train_cnn.py`,
+`infer_cnn_boxes.py` — was removed. There is no model training/inference here anymore.)
 
 ## End-to-end pipeline
 
-The scripts are independent CLIs that communicate via files on disk, in this order:
+Two independent CLIs that communicate via files on disk, in order:
 
-1. **`google_ocr.py`** — runs Google Cloud Vision `document_text_detection` on input images. For each image it writes:
-   - `test_output/<base>_char_boxes.json` — per-symbol records with `char`, 4-vertex `vertices`, and OCR hierarchy indices (`page`/`block`/`paragraph`/`word`/`symbol`). All symbols are saved, not only Hebrew.
-   - `test_output/<base>_bbox.<ext>` and `_warped.<ext>` — only produced when Hebrew characters exist. The page-level convex-hull → 4-point quadrilateral is approximated from Hebrew-only points and used for a perspective warp.
-   - `test_output/<base>_all_boxes.<ext>` — overlay of every character quad (file name is "all_boxes" for historical reasons; contents are character-level, not word-level).
-   - `test_output/char_dataset/<class>/...png` (when `--dataset-out` is set) — per-character crops rectified via perspective transform, grouped by class directory `U<HEX>_<char>` (codepoint-prefixed for stable, collision-free names).
+1. **`google_ocr.py`** — runs Google Cloud Vision `document_text_detection` on input images and is
+   the **source of truth for box geometry**. For each image it writes:
+   - `test_output/<base>_char_boxes.json` — per-symbol records with `char`, 4-vertex `vertices`,
+     and OCR hierarchy indices (`page`/`block`/`paragraph`/`word`/`symbol`). All symbols are
+     saved, not only Hebrew. **This is the only output `prep_image.py` consumes.**
+   - `test_output/<base>_bbox.<ext>`, `_warped.<ext>`, `_all_boxes.<ext>`, and (with
+     `--dataset-out`) per-character crops under `char_dataset/` — legacy artifacts from the old
+     CNN flow. Still produced, but nothing downstream reads them now.
 
-2. **`export_coco_from_ocr.py`** — converts the `*_char_boxes.json` files into a single COCO JSON. Note: `category_id` is currently hard-coded to `1` in `coco_annotations` (the `char_to_cat` map is built but unused). Output defaults to `<images-dir>/instances_chars.json`.
+2. **`prep_image.py`** — reads `<base>_char_boxes.json` (no re-OCR, so iterating on geometry costs
+   no API calls) and runs a short pipeline, writing a debug PNG after each step to
+   `test_output/debug/<base>/`:
+   - `01_original` (+ `_overlay` of all OCR char quads)
+   - `02_orientation` (+ `_overlay`) — global rotation fix. `estimate_orientation` takes the
+     circular mean of each box's reading-direction vector (`v[1]-v[0]`); `rotate_bound` rotates the
+     canvas (expanding so nothing clips) to bring text to horizontal. Box coords are carried
+     through the same affine.
+   - `03_crop_polygon` — overlay of the text region's convex hull (`text_hull`, Hebrew points
+     only when present).
+   - `03_cropped` — **the final output**: `mask_and_crop` blanks everything outside the hull
+     polygon (to white) and crops to the polygon's bounding box.
 
-3. **`train_cnn.py`** — trains a small CNN classifier (~5 conv layers + AdaptiveAvgPool + Linear, defined inline in `build_model`) on the per-class char crops produced by step 1. Writes `model.pt`, `meta.json`, `confusion_matrix.csv`, `per_class_accuracy.json` to `test_output/cnn_model/`.
+## Critical detail: EXIF orientation / coordinate frame
 
-4. **`infer_cnn_boxes.py`** — uses the trained CNN to **classify** the OCR-proposed character boxes (the CNN does not localize). Reads `<base>_char_boxes.json` from step 1, re-crops with matching padding, runs `model(crop)`, and writes overlaid PNGs to `test_output/cnn_boxes/`.
+Google Vision reports box coordinates against the **raw, un-rotated** pixels and ignores EXIF
+orientation. `cv2.imread`, by contrast, **auto-applies** EXIF orientation. So for any photo with a
+rotation tag (e.g. phone shots with EXIF Orientation = 6), a plain `cv2.imread` loads pixels 90°
+out of sync with the saved boxes, and orientation correction comes out 90° wrong.
 
-The implication: `google_ocr.py` is the source of truth for box geometry — both training crops and inference proposals come from it. If you change the crop logic (padding, perspective, polarity), keep `google_ocr.py::export_char_dataset` and `infer_cnn_boxes.py::crop_quad_with_padding` in sync, and re-run OCR + retrain.
-
-## Critical pre-processing detail
-
-`train_cnn.py::pil_to_tensor_gray` performs more than resize+normalize: it autocontrasts, **inverts polarity** if the median pixel is dark (so glyphs end up dark-on-light), and **Otsu-binarizes** by default. `infer_cnn_boxes.py` imports and reuses this exact function, so the same transforms apply at inference. Toggling `--no-binarize` during training without rebuilding inference will silently produce a distribution mismatch.
+`prep_image.py::imread_boxframe` loads with `cv2.IMREAD_IGNORE_ORIENTATION` so pixels stay in the
+boxes' frame; the orientation step then straightens everything from box geometry alone. If you add
+any new image read in this pipeline, use `imread_boxframe`, not `cv2.imread`, or boxes and pixels
+will desync. (`google_ocr.py` uses plain `cv2.imread` for its own legacy overlays/warps, so those
+artifacts can be misaligned for EXIF-rotated inputs — but `prep_image.py` does not rely on them.)
 
 ## Running things
 
-Each script is a standalone CLI. There is no build system, no lint config, and no tests in the repo.
+Each script is a standalone CLI. No build system, no lint config, no tests.
 
 ```bash
-# 1. OCR + per-character crop export (requires GOOGLE_APPLICATION_CREDENTIALS)
+# 1. OCR -> char boxes (needs Vision credentials; see Dependencies)
 python google_ocr.py --images-dir images/before_crop --output-dir test_output \
-    --dataset-out test_output/char_dataset --skip-existing
+    --dataset-out "" --skip-existing
+# single image:
+python google_ocr.py --image path/to/file.jpg --output-dir test_output --dataset-out ""
 
-# 2. COCO export (optional, only if you need detection-style annotations)
-python export_coco_from_ocr.py --images-dir images/before_crop --boxes-dir test_output
-
-# 3. Train classifier
-python train_cnn.py --data-dir test_output/char_dataset --out-dir test_output/cnn_model
-
-# 4. Run classifier on OCR boxes and write annotated images
-python infer_cnn_boxes.py --test-dir images/_test_set --char-boxes-dir test_output \
-    --model-dir test_output/cnn_model --out-dir test_output/cnn_boxes
+# 2. Orientation fix + crop to text polygon (reads the boxes from step 1)
+python prep_image.py --image images/before_crop/<base>.jpg \
+    --char-boxes test_output/<base>_char_boxes.json
+# if boxes are missing, --run-ocr will invoke google_ocr.detect_text first
 ```
 
-Single-image OCR run: `python google_ocr.py --image path/to/file.jpg`.
-
-When no input flag is passed, `google_ocr.py` defaults to globbing `images/_test_set/*.{jpg,jpeg,png}`.
+When no input flag is passed, `google_ocr.py` defaults to globbing
+`images/_test_set/*.{jpg,jpeg,png}`. `prep_image.py` defaults `--char-boxes` to
+`test_output/<base>_char_boxes.json` and writes debug output under `test_output/debug/<base>/`.
 
 ## Image folder conventions
 
 - `images/_test_set/` — small hand-picked set used as the default OCR input.
-- `images/before_crop/`, `images/after_crop/`, `images/aligned_cropped/` — staged corpora at different points of manual pre-processing. They are not produced by these scripts; they are inputs.
-- `images/before_crop/instances_chars.json` — output of `export_coco_from_ocr.py` lives next to its images (file names in the COCO JSON are basenames, relative to that directory).
+- `images/before_crop/`, `images/after_crop/`, `images/aligned_cropped/` — staged corpora at
+  different points of manual pre-processing. They are inputs, not produced by these scripts.
 
 ## Dependencies
 
 There is no `requirements.txt`. Imports tell you what must be installed in the active environment:
 
-- `google.cloud.vision` (and `GOOGLE_APPLICATION_CREDENTIALS` env var pointing at a service-account JSON) — only `google_ocr.py`.
-- `torch` — only `train_cnn.py` and `infer_cnn_boxes.py`. Imported lazily inside functions so that the other scripts work without it.
-- `opencv-python` (`cv2`), `Pillow` (`PIL`), `numpy` — used across scripts.
+- `google.cloud.vision` — only `google_ocr.py`. Authenticates via Application Default Credentials
+  (`gcloud auth application-default login`) or `GOOGLE_APPLICATION_CREDENTIALS` pointing at a
+  service-account JSON.
+- `opencv-python` (`cv2`), `Pillow` (`PIL`), `numpy` — used by both scripts.
 
-If you add new dependencies, prefer keeping torch imports lazy so the OCR and COCO scripts stay runnable in environments without it.
+`torch` is no longer a dependency (the CNN scripts were removed).
