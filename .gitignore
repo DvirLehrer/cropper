@@ -12,3 +12,9 @@ venv/
 images/
 test_output/
 *.zip
+
+# Secrets / credentials
+hf_token
+*_token
+*.json.key
+credentials*.json
