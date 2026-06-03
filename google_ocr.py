@@ -130,11 +130,18 @@ def detect_text(
 
         return written
 
+    output_dir = output_dir or "test_output"
+    os.makedirs(output_dir, exist_ok=True)
+
+    filename = os.path.basename(path)
+    name, ext = os.path.splitext(filename)
+
     # Downscale large images before sending to Vision (faster upload + processing,
     # no measurable box-count loss at ~1MP). We OCR the smaller image but scale the
     # returned vertices back to the ORIGINAL frame (via inv_scale below), so
     # char_boxes.json -- and every internal overlay/warp, which read the original
     # `path` -- all stay in one coordinate frame regardless of downscaling.
+
     scale = 1.0
     raw = cv2.imread(path, cv2.IMREAD_IGNORE_ORIENTATION | cv2.IMREAD_COLOR) if max_pixels else None
     if raw is not None and raw.shape[0] * raw.shape[1] > max_pixels:
@@ -142,11 +149,14 @@ def detect_text(
         scale = (max_pixels / (h * w)) ** 0.5
         small = cv2.resize(raw, (max(1, round(w * scale)), max(1, round(h * scale))),
                            interpolation=cv2.INTER_AREA)
-        ok, buf = cv2.imencode(os.path.splitext(path)[1] or ".jpg", small)
+        ok, buf = cv2.imencode(ext or ".jpg", small)
         if not ok:
             raise RuntimeError(f"failed to encode downscaled image for {path}")
         content = buf.tobytes()
         print(f"Downscaled {w}x{h} -> {small.shape[1]}x{small.shape[0]} (<= {max_pixels} px) for OCR")
+        ocr_input_path = os.path.join(output_dir, f"{name}_ocr_input{ext}")
+        cv2.imwrite(ocr_input_path, small)
+        print(f"  saved OCR input (downscaled) to: {ocr_input_path}")
     else:
         with open(path, "rb") as image_file:
             content = image_file.read()
@@ -262,13 +272,6 @@ def detect_text(
             "https://cloud.google.com/apis/design/errors".format(response.error.message)
         )
 
-    # Save outputs (JSON + overlays)
-    output_dir = output_dir or "test_output"
-    os.makedirs(output_dir, exist_ok=True)
-
-    filename = os.path.basename(path)
-    name, ext = os.path.splitext(filename)
-
     # If we didn't find any Hebrew characters, skip the page-level quad/warp,
     # but still export per-symbol (character) boxes JSON (and an overlay) so COCO export
     # can include this image (possibly with 0 annotations).
@@ -354,13 +357,6 @@ def detect_text(
 
     # Import ImageDraw here
     from PIL import ImageDraw, ImageFont
-
-    # Save outputs (JSON + overlays)
-    output_dir = output_dir or "test_output"
-    os.makedirs(output_dir, exist_ok=True)
-
-    filename = os.path.basename(path)
-    name, ext = os.path.splitext(filename)
 
     # Perform perspective transformation to convert quadrilateral to rectangle
     ordered_quad = order_points(box.astype(np.float32))
