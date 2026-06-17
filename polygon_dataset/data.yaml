@@ -1,0 +1,7 @@
+path: /Users/dvirlehrer/dev/stam_crop/stam/polygon_dataset
+train: images/train
+val:   images/val
+test:  images/test
+nc: 1
+names:
+  0: text_region
