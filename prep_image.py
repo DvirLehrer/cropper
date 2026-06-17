@@ -24,6 +24,7 @@ import os
 import re
 import json
 import argparse
+import difflib
 
 import cv2
 import numpy as np
@@ -32,6 +33,147 @@ import numpy as np
 def contains_hebrew(text: str) -> bool:
     """True if the string contains a Hebrew codepoint (U+0590..U+05FF)."""
     return bool(re.search(r"[֐-׿]", text or ""))
+
+
+# Known mezuza text: two parshiyot, consonants only, no spaces/punctuation.
+# First parasha uses כתיב חסר spellings (מזזות, לטטפת).
+MEZUZA_TEXT = (
+    "שמעישראליהוהאלהינויהוהאחד"
+    "ואהבתאתיהוהאלהיךבכללבבךובכלנפשךובכלמאדך"
+    "והיוהדבריםהאלהאשראנכימצוךהיוםעללבבך"
+    "ושננתםלבניךודברתבםבשבתךבביתךובלכתךבדרךובשכבךובקומך"
+    "וקשרתםלאותעלידךוהיולטטפתביןעיניך"
+    "וכתבתםעלמזזותביתךובשעריך"
+    "והיהאםשמועתשמעואלמצותיאשראנכי"
+    "מצוהאתכםהיוםלאהבהאתיהוהאלהיכםולעבדו"
+    "בכללבבכםובכלנפשכםונתתימטרארצכםבעתו"
+    "יורהומלקושואספתדגנךותירשךויצהרך"
+    "ונתתיעשببשדךלבהמתךואכלתושבעת"
+    "השמרולכםפןיפתהלבבכםוסרתםועבדתםאלהיםאחרים"
+    "והשתחויתםלהםוחרהאףיהוהבכםועצראת"
+    "השמיםולאיהיהמטרוהאדמהלאתתןאתיבולה"
+    "ואבדתםמהרהמעלהארץהטבהאשריהוהנתןלכם"
+    "ושמתםאתדבריאלהעללבבכםועלנפשכםוקשרתם"
+    "אתםלאותעלידכםוהיולטוטפתביןעיניכםולמדתם"
+    "אתםאתבניכםלדברבםבשבתךבביתךובלכתך"
+    "בדרךובשכבךובקומךוכתבתםעלמזוזותביתך"
+    "ובשעריךלמעןירבוימיכםוימיבניכםעלהאדמה"
+    "אשרנשבעיהוהלאבתיכםלתתלהםכימיהשמיםעלהארץ"
+)
+
+
+# ---- reading order + alignment --------------------------------------------
+
+def reading_order(boxes: np.ndarray, chars: list, hebrew_mask: np.ndarray):
+    """Return (boxes, chars) sorted into RTL reading order (Hebrew only).
+
+    Uses 1-D k-means on box centre-y to cluster into lines (gap-based
+    clustering fails because STaM letter height often exceeds line spacing,
+    so adjacent lines overlap in y). Lines are sorted top-to-bottom;
+    within each line characters are sorted right-to-left by centre-x.
+    """
+    heb_boxes = boxes[hebrew_mask]
+    heb_chars = [c for c, h in zip(chars, hebrew_mask) if h]
+    if len(heb_boxes) == 0:
+        return heb_boxes, heb_chars
+
+    center_ys = heb_boxes[:, :, 1].mean(axis=1)
+    char_h = float(np.median(heb_boxes[:, :, 1].max(axis=1) - heb_boxes[:, :, 1].min(axis=1)))
+
+    # Estimate number of lines from y range and typical line spacing.
+    y_range = float(center_ys.max() - center_ys.min())
+    k = max(2, round(y_range / (char_h * 0.8)))
+
+    # 1-D k-means (no external deps).
+    centroids = np.linspace(center_ys.min(), center_ys.max(), k)
+    for _ in range(30):
+        dists = np.abs(center_ys[:, None] - centroids[None, :])
+        labels = dists.argmin(axis=1)
+        new_c = np.array([
+            center_ys[labels == i].mean() if (labels == i).any() else centroids[i]
+            for i in range(k)
+        ])
+        if np.allclose(centroids, new_c):
+            break
+        centroids = new_c
+
+    line_order = np.argsort(centroids)
+    out_boxes, out_chars = [], []
+    for li in line_order:
+        mask = labels == li
+        lb = heb_boxes[mask]
+        lc = [heb_chars[i] for i, m in enumerate(mask) if m]
+        rtl = np.argsort(-lb[:, :, 0].mean(axis=1))
+        out_boxes.append(lb[rtl])
+        out_chars.extend([lc[i] for i in rtl])
+
+    return np.concatenate(out_boxes, axis=0), out_chars
+
+
+def estimate_missing_boxes(boxes: np.ndarray, chars: list) -> np.ndarray:
+    """Align detected Hebrew chars to the known mezuza text and interpolate
+    bounding boxes for missed characters.  Returns the augmented box array
+    (detected + estimated) for use in hull computation.
+
+    The alignment is fuzzy (SequenceMatcher) so OCR errors don't break it.
+    Interpolated boxes are placed midway between their detected neighbours;
+    they carry no identity information and are only used for geometry.
+    """
+    detected_str = "".join(chars)
+    known = MEZUZA_TEXT
+
+    matcher = difflib.SequenceMatcher(None, detected_str, known, autojunk=False)
+    # Build a map: known_index -> detected_index (or None if missing).
+    known_to_detected = [None] * len(known)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for di, ki in enumerate(range(j1, j2)):
+                known_to_detected[ki] = i1 + di
+        elif tag == "replace":
+            # Treat replaced chars as matched (OCR error, position still valid).
+            for di in range(min(i2 - i1, j2 - j1)):
+                known_to_detected[j1 + di] = i1 + di
+
+    # Collect detected positions (centre points) indexed by known position.
+    centres = {}  # known_index -> (cx, cy)
+    for ki, di in enumerate(known_to_detected):
+        if di is not None and di < len(boxes):
+            b = boxes[di]
+            centres[ki] = (float(b[:, 0].mean()), float(b[:, 1].mean()))
+
+    if not centres:
+        return boxes
+
+    # Interpolate missing positions.
+    detected_ki = sorted(centres.keys())
+    extra_boxes = []
+    for ki in range(len(known)):
+        if ki in centres:
+            continue
+        # Find nearest detected neighbours before and after.
+        lo = max((k for k in detected_ki if k < ki), default=None)
+        hi = min((k for k in detected_ki if k > ki), default=None)
+        if lo is None and hi is None:
+            continue
+        elif lo is None:
+            cx, cy = centres[hi]
+        elif hi is None:
+            cx, cy = centres[lo]
+        else:
+            t = (ki - lo) / (hi - lo)
+            cx = centres[lo][0] * (1 - t) + centres[hi][0] * t
+            cy = centres[lo][1] * (1 - t) + centres[hi][1] * t
+
+        # Synthesise a tiny box (1px) at the interpolated centre.
+        # Its sole job is to anchor the convex hull at the right location.
+        pt = np.array([[cx, cy]], dtype=np.float32)
+        extra_boxes.append(np.tile(pt, (4, 1)).reshape(1, 4, 2))
+
+    if not extra_boxes:
+        return boxes
+    extra = np.concatenate(extra_boxes, axis=0)
+    print(f"  interpolated {len(extra)} missing character positions")
+    return np.concatenate([boxes, extra], axis=0)
 
 
 # ---- I/O ------------------------------------------------------------------
@@ -198,9 +340,16 @@ def run_pipeline(image_path: str, json_path: str, out_dir: str, max_pixels: int 
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
     save_step(out_dir, "02_orientation_overlay.png", ov2)
 
+    # --- Step 2b: estimate missing character positions via text alignment ---
+    print("Step 2b: align to known mezuza text")
+    ordered_boxes, ordered_chars = reading_order(boxes2, chars, hebrew)
+    augmented_boxes2 = estimate_missing_boxes(ordered_boxes, ordered_chars)
+
     # --- Step 3: crop to the text polygon ---
     print("Step 3: crop to polygon")
-    hull = text_hull(boxes2, hebrew, img2.shape)
+    # Build a synthetic all-True mask for the augmented box set (all are Hebrew positions).
+    aug_hebrew = np.ones(len(augmented_boxes2), dtype=bool)
+    hull = text_hull(augmented_boxes2, aug_hebrew, img2.shape)
     if hull is None:
         print("  no usable hull; skipping crop")
         return
