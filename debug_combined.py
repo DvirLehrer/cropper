@@ -28,7 +28,7 @@ from ultralytics import YOLO
 from crop_with_model import _predict, _tiled_predict, _imgsz_for, SPLIT_RATIO
 from crop_stam import (
     run_ocr, adjacent_ocr_corners, union_polygon,
-    CONF, IMG_EXTS, MODEL_PATH, OCR_MAX_PIXELS,
+    CONF, IMG_EXTS, MODEL_PATH, OCR_MAX_PIXELS, ROTATE_RATIO,
 )
 
 BENCH_DIR = 'images/benchmark'
@@ -144,9 +144,29 @@ def process(model, img_path: str, out_dir: str) -> dict:
     result[union_mask == 255] = img[union_mask == 255]
     x, y, w, h = cv2.boundingRect(boundary.astype(np.int32))
 
+    cropped = result[y:y+h, x:x+w]
+
+    # Rotate very vertical crops CCW (based on actual text region ratio)
+    if h / max(w, 1) >= ROTATE_RATIO:
+        cropped = cv2.rotate(cropped, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    # Background contrast reduction (mirrors crop_stam.py)
+    _ch, _cw = cropped.shape[:2]
+    if min(_ch, _cw) >= 500 and max(_ch, _cw) / min(_ch, _cw) <= 4:
+        lab       = cv2.cvtColor(cropped, cv2.COLOR_BGR2LAB)
+        l, a, b   = cv2.split(lab)
+        thresh, _ = cv2.threshold(l, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        bg_mask   = l >= min(255, int(thresh) + 20)
+        if bg_mask.any():
+            lf        = l.astype(np.float32)
+            mean_bg   = float(lf[bg_mask].mean())
+            lf[bg_mask] = mean_bg + (lf[bg_mask] - mean_bg) * 0.3
+            l_new     = np.clip(lf, 0, 255).astype(np.uint8)
+            cropped   = cv2.cvtColor(cv2.merge([l_new, a, b]), cv2.COLOR_LAB2BGR)
+
     crop_dir = out_dir.replace('debug_combined', 'cropped_combined')
     os.makedirs(crop_dir, exist_ok=True)
-    cv2.imwrite(os.path.join(crop_dir, f'{stem}_cropped.jpg'), result[y:y+h, x:x+w],
+    cv2.imwrite(os.path.join(crop_dir, f'{stem}_cropped.jpg'), cropped,
                 [cv2.IMWRITE_JPEG_QUALITY, 92])
 
     return {'seg': t_seg, 'ocr': t_ocr, 'extend': t_extend, 'wall': t_wall + t_extend}

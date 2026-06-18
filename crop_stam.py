@@ -37,6 +37,7 @@ CLUSTER_GAP_PCT = 0.04        # dilation to bridge inter-character gaps (% of sh
 MODEL_REACH_PCT = 0.04        # dilation on model mask to catch border boxes
 EXTEND_WORK_PX  = 1000        # max dimension for connectedComponents work canvas
 HEBREW_RANGE    = ('א', 'ת')
+ROTATE_RATIO    = 3.0         # rotate CCW when crop H/W exceeds this
 
 # ── Vision API client (singleton) ──────────────────────────────────────────────
 _vision_client = None
@@ -49,24 +50,27 @@ def _get_vision_client():
 
 
 # ── OCR ────────────────────────────────────────────────────────────────────────
-def run_ocr(img_path: str) -> list:
-    """Call Google Vision document_text_detection on an image file.
+def run_ocr(img_source) -> list:
+    """Call Google Vision document_text_detection.
+    img_source: file path (str) or numpy BGR array (e.g. after rotation).
     Downscales to ≤OCR_MAX_PIXELS before sending.
     Returns list of {char, vertices} dicts (Hebrew chars only) in original pixel coords."""
-    raw = cv2.imread(img_path, cv2.IMREAD_IGNORE_ORIENTATION | cv2.IMREAD_COLOR)
+    if isinstance(img_source, np.ndarray):
+        raw = img_source
+    else:
+        raw = cv2.imread(img_source, cv2.IMREAD_IGNORE_ORIENTATION | cv2.IMREAD_COLOR)
     if raw is None:
         return []
     h, w  = raw.shape[:2]
-    ext   = Path(img_path).suffix or '.jpg'
     scale = 1.0
     if h * w > OCR_MAX_PIXELS:
         scale = (OCR_MAX_PIXELS / (h * w)) ** 0.5
-        small = cv2.resize(raw, (max(1, round(w * scale)), max(1, round(h * scale))),
+        raw   = cv2.resize(raw, (max(1, round(w * scale)), max(1, round(h * scale))),
                            interpolation=cv2.INTER_AREA)
-        ok, buf = cv2.imencode(ext, small)
-        content = buf.tobytes() if ok else open(img_path, 'rb').read()
-    else:
-        content = open(img_path, 'rb').read()
+    ok, buf = cv2.imencode('.jpg', raw, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    if not ok:
+        return []
+    content = buf.tobytes()
 
     inv      = 1.0 / scale
     response = _get_vision_client().document_text_detection(
@@ -235,6 +239,25 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
 
     x, y, w, h = cv2.boundingRect(boundary.astype(np.int32))
     cropped    = result[y:y+h, x:x+w]
+
+    # Rotate very vertical crops CCW (ratio based on actual text region, not full image)
+    if h / max(w, 1) >= ROTATE_RATIO:
+        cropped = cv2.rotate(cropped, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    # Background contrast reduction: only on large, roughly square images.
+    # Skipped for low-res (strokes too thin) and high-ratio (elongated strips).
+    _ch, _cw = cropped.shape[:2]
+    if min(_ch, _cw) >= 500 and max(_ch, _cw) / min(_ch, _cw) <= 4:
+        lab       = cv2.cvtColor(cropped, cv2.COLOR_BGR2LAB)
+        l, a, b   = cv2.split(lab)
+        thresh, _ = cv2.threshold(l, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        bg_mask   = l >= min(255, int(thresh) + 20)
+        if bg_mask.any():
+            lf        = l.astype(np.float32)
+            mean_bg   = float(lf[bg_mask].mean())
+            lf[bg_mask] = mean_bg + (lf[bg_mask] - mean_bg) * 0.3
+            l_new     = np.clip(lf, 0, 255).astype(np.uint8)
+            cropped   = cv2.cvtColor(cv2.merge([l_new, a, b]), cv2.COLOR_LAB2BGR)
 
     os.makedirs(out_dir, exist_ok=True)
     stem     = Path(img_path).stem

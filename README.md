@@ -1,54 +1,102 @@
-# stam
+# STaM Crop
 
-Hebrew character recognition pipeline for STaM (Sefer Torah, Tefillin, Mezuzah) imagery.
+Image pre-processing for STaM (Sefer Torah, Tefillin, Mezuzah) manuscripts: takes a raw photo or
+scan of parchment text and produces a tightly-cropped image of the text region, ready for downstream
+analysis.
 
-Four standalone Python scripts that communicate via files on disk under `test_output/`:
-
-1. **`google_ocr.py`** — runs Google Cloud Vision `document_text_detection` on input images and writes:
-   - `<base>_char_boxes.json` — per-symbol records (character, 4-vertex polygon, OCR hierarchy indices).
-   - `<base>_bbox.<ext>` + `<base>_warped.<ext>` — page-level quad (fit to Hebrew points only) and its perspective-warped rectangle.
-   - `<base>_all_boxes.<ext>` — overlay of every character quad.
-   - `char_dataset/<class>/...png` — per-character crops grouped by class folder `U<HEX>_<char>`, ready for training.
-
-2. **`export_coco_from_ocr.py`** — turns the `*_char_boxes.json` files into a single COCO JSON for detection-style use.
-
-3. **`train_cnn.py`** — trains a small CNN classifier on the per-class crops. Writes `model.pt`, `meta.json`, `confusion_matrix.csv`, `per_class_accuracy.json`.
-
-4. **`infer_cnn_boxes.py`** — uses the trained CNN to classify the OCR-proposed boxes from step 1 and writes annotated overlays. The CNN does not localize — Google Vision is still the source of box geometry.
-
-## Setup
-
-No `requirements.txt`. Install what each script imports into your active Python env:
-
-- All scripts: `numpy`, `Pillow`, `opencv-python`
-- `google_ocr.py`: `google-cloud-vision`, plus `GOOGLE_APPLICATION_CREDENTIALS` pointing at a service-account JSON
-- `train_cnn.py`, `infer_cnn_boxes.py`: `torch`
-
-Torch is imported lazily, so the OCR and COCO scripts run fine without it.
-
-## Usage
+## Quick start
 
 ```bash
-# 1. OCR + per-character crop export
-python google_ocr.py --images-dir images/before_crop --output-dir test_output \
-    --dataset-out test_output/char_dataset --skip-existing
+# Single image
+python3 crop_stam.py --image path/to/photo.jpg
 
-# 2. COCO export (optional)
-python export_coco_from_ocr.py --images-dir images/before_crop --boxes-dir test_output
-
-# 3. Train classifier
-python train_cnn.py --data-dir test_output/char_dataset --out-dir test_output/cnn_model
-
-# 4. Classify OCR boxes and write annotated images
-python infer_cnn_boxes.py --test-dir images/_test_set --char-boxes-dir test_output \
-    --model-dir test_output/cnn_model --out-dir test_output/cnn_boxes
+# Batch
+python3 crop_stam.py --images-dir images/benchmark --out-dir test_output/cropped
 ```
 
-Single-image OCR: `python google_ocr.py --image path/to/file.jpg`.
-With no input flag, `google_ocr.py` defaults to `images/_test_set/*.{jpg,jpeg,png}`.
+## Dependencies
 
-## Notes
+| Package | Used by |
+|---------|---------|
+| `ultralytics` | `crop_stam.py`, `crop_with_model.py` |
+| `google-cloud-vision` | `crop_stam.py`, `google_ocr.py` |
+| `opencv-python` | everything |
+| `numpy` | everything |
+| `Pillow` | `training/` scripts |
 
-- `train_cnn.py::pil_to_tensor_gray` autocontrasts, flips polarity if the median pixel is dark, and Otsu-binarizes by default. `infer_cnn_boxes.py` reuses the same function — keep `--binarize` consistent between training and inference.
-- `export_coco_from_ocr.py` currently writes `category_id: 1` for every annotation (single-class detection setup); the per-character category map is built but unused.
-- Images, model artifacts, and derived `test_output/` data are gitignored. The repo tracks code only.
+Google Vision authenticates via Application Default Credentials (`gcloud auth application-default login`)
+or the `GOOGLE_APPLICATION_CREDENTIALS` environment variable.
+
+## Project layout
+
+```
+crop_stam.py          # Production CLI
+crop_with_model.py    # YOLO inference helpers (imported by crop_stam.py)
+google_ocr.py         # Standalone OCR tool for labelling new training data
+debug_combined.py     # Benchmark visualiser — runs the pipeline and draws overlays
+roi_inference.py      # Interactive model tester (OpenCV window)
+best.pt               # YOLOv8-seg model weights
+images/
+  benchmark/          # 39 hand-picked test images
+  corpus/             # Full image corpus (megilot, mezuzot, tefillin, torah)
+training/             # Dataset building and retraining tools
+```
+
+## Pipeline
+
+Each image goes through the following steps in `crop_stam.py`:
+
+1. **Load** with `cv2.IMREAD_IGNORE_ORIENTATION` — preserves raw pixel coordinates to match
+   Google Vision (which also ignores EXIF rotation).
+
+2. **Segmentation + OCR in parallel** (`ThreadPoolExecutor`)
+   - **Segmentation**: YOLOv8-seg (`best.pt`) detects the text-region polygon. For extreme-ratio
+     images (> 10:1), 3-tile tiled inference with 15% overlap; polygons merged via convex hull.
+   - **OCR**: Google Vision `document_text_detection`, downscaled to ≤ 1 MP before sending.
+     Returns Hebrew character bounding boxes (`א`–`ת`) in original pixel coordinates.
+
+3. **Extend OCR**: Hebrew boxes are grouped into connected text clusters (dilated footprints →
+   `connectedComponents`). Any cluster that touches the model polygon is included in full — so
+   if the model captures one end of a line, the rest of the line is pulled in automatically.
+
+4. **Union polygon**: convex hull over included OCR corners, then binary-mask OR with the model
+   polygon → outer contour = final text boundary.
+
+5. **Fill and crop**: sample parchment colour from non-ink pixels inside the model polygon (Otsu
+   threshold on L channel). Fill everything outside the boundary with that colour. Crop to the
+   boundary bounding box.
+
+6. **Rotate**: if the cropped region is taller than 3× its width, rotate 90° counter-clockwise.
+
+7. **Background flattening**: for large, roughly square crops (short side ≥ 500 px, aspect ≤ 4:1),
+   pull background pixel luminance toward the mean background tone, reducing parchment texture
+   contrast without touching the ink.
+
+**Average wall time: ~620 ms** (segmentation ~65 ms + OCR ~575 ms in parallel; extend ~45 ms).
+Bottleneck is the Google Vision API call.
+
+## Debug / benchmark
+
+```bash
+python3 debug_combined.py --images-dir images/benchmark
+python3 debug_combined.py --image images/benchmark/mezuza3.jpeg
+```
+
+Writes to `test_output/debug_combined/` (polygon overlays) and `test_output/cropped_combined/`
+(cropped output identical to `crop_stam.py`).
+
+Overlay colour key: green = included OCR boxes, dark-red = excluded, blue = OCR hull,
+bright-green = model polygon, red (thick) = final union boundary.
+
+## Retraining
+
+Use the tools in `training/` when the model needs updating:
+
+1. **Label new images** — `training/polygon_editor.py`: interactive tool to approve/edit YOLO
+   polygon labels.
+2. **OCR new images** (if needed) — `google_ocr.py`: caches Vision API results to JSON.
+3. **Build dataset** — `training/build_yolo_polygon.py`: converts labels to YOLO seg format in
+   `yolo_polygon/`. Optional synthetic data via `generate_synthetic_scroll.py` +
+   `build_synthetic_yolo.py`.
+4. **Train** — upload `yolo_polygon/` to Google Drive, run `training/train_yolo.ipynb` on Colab.
+5. **Deploy** — replace `best.pt` in the repo root.
