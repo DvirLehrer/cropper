@@ -4,6 +4,58 @@ Image pre-processing for STaM (Sefer Torah, Tefillin, Mezuzah) manuscripts: take
 scan of parchment text and produces a tightly-cropped image of the text region, ready for downstream
 analysis.
 
+## Installation
+
+### 1. Python dependencies
+
+Requires Python 3.8+.
+
+```bash
+pip install ultralytics google-cloud-vision opencv-python numpy Pillow
+```
+
+### 2. Google Cloud Vision API
+
+The OCR step calls the Google Cloud Vision API, which requires a Google Cloud project with billing enabled.
+
+**One-time setup:**
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com) and create or select a project.
+2. Enable the **Cloud Vision API** for that project:
+   [console.cloud.google.com/apis/library/vision.googleapis.com](https://console.cloud.google.com/apis/library/vision.googleapis.com)
+3. Set up billing for the project (Vision API has a free tier of 1,000 units/month).
+
+**Authentication — choose one option:**
+
+**Option A: `gcloud` CLI (easiest for local development)**
+
+```bash
+# Install the gcloud CLI: https://cloud.google.com/sdk/docs/install
+gcloud auth application-default login
+```
+
+**Option B: Service account key file**
+
+1. In the Cloud Console, go to **IAM & Admin → Service Accounts**.
+2. Create a service account and grant it the **Cloud Vision API User** role.
+3. Create a JSON key for it and download it.
+4. Point the environment variable at the file:
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your-key.json"
+```
+
+Add that line to your `~/.zshrc` or `~/.bashrc` to make it permanent.
+
+### 3. Model weights
+
+The YOLOv8 segmentation model (`best.pt`) must be present in the repo root. It is not included in
+the repository due to file size. Download it from the project's release assets and place it at:
+
+```
+cropper/best.pt
+```
+
 ## Quick start
 
 ```bash
