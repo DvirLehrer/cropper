@@ -49,12 +49,7 @@ Add that line to your `~/.zshrc` or `~/.bashrc` to make it permanent.
 
 ### 3. Model weights
 
-The YOLOv8 segmentation model (`best.pt`) must be present in the repo root. It is not included in
-the repository due to file size. Download it from the project's release assets and place it at:
-
-```
-cropper/best.pt
-```
+The YOLOv8 segmentation model (`best.pt`) is included in the repository root. No additional download is needed.
 
 ## Quick start
 
