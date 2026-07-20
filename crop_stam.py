@@ -240,8 +240,17 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
     x, y, w, h = cv2.boundingRect(boundary.astype(np.int32))
     cropped    = result[y:y+h, x:x+w]
 
-    # Rotate very vertical crops CCW (ratio based on actual text region, not full image)
-    if h / max(w, 1) >= ROTATE_RATIO:
+    # Rotate very vertical crops CCW.
+    # Fast path: aspect ratio of the crop.  Fallback: OCR centroid spread (catches
+    # scrolls whose crop isn't yet 3:1 but whose characters clearly run top-to-bottom).
+    def _ocr_is_vertical() -> bool:
+        if not ocr_boxes:
+            return False
+        cx = [sum(v['x'] for v in b['vertices']) / len(b['vertices']) for b in ocr_boxes]
+        cy = [sum(v['y'] for v in b['vertices']) / len(b['vertices']) for b in ocr_boxes]
+        return (max(cy) - min(cy)) > (max(cx) - min(cx))
+
+    if h / max(w, 1) >= ROTATE_RATIO or _ocr_is_vertical():
         cropped = cv2.rotate(cropped, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
     # Background contrast reduction: only on large, roughly square images.
