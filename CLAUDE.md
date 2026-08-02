@@ -29,10 +29,17 @@ python3 crop_stam.py --images-dir images/benchmark --out-dir test_output/cropped
 
 ### Steps (per image)
 
-1. **Load** with `cv2.IMREAD_IGNORE_ORIENTATION` — keeps pixels in the same coordinate frame as
-   Google Vision (Vision ignores EXIF; cv2 normally auto-applies it).
+1. **Load** via `stam_io.imread_any()` — decodes JPEG/PNG **and HEIC** (iPhone uploads often
+   arrive as HEIC with a `.jpg` extension; `cv2.imread` returns `None` for those, so the image
+   was silently skipped). EXIF orientation is deliberately not applied, keeping pixels in the
+   same coordinate frame as Google Vision, which ignores EXIF.
 
 2. **Segmentation + OCR in parallel** (`ThreadPoolExecutor(max_workers=2)`)
+
+   Both branches get the **same decoded array**, never the file path. Handing a path to
+   Ultralytics makes it run its own `cv2.imread`, which *does* apply EXIF orientation — for an
+   image tagged `orientation=6` that put the model polygon in a frame rotated 90° from the OCR
+   boxes. Passing the array also avoids decoding each file three times.
 
    - **Segmentation** (`crop_with_model.py`): YOLOv8-seg (`best.pt`) → text-region polygon.
      Dynamic `imgsz` ensures the short dimension maps to ≥ 128 px in model input.
@@ -67,7 +74,17 @@ python3 crop_stam.py --images-dir images/benchmark --out-dir test_output/cropped
    the mean background tone with a 0.3 retention factor. Suppresses parchment texture without
    affecting ink or changing overall brightness.
 
-10. **Save** as JPEG (quality 92).
+10. **Save** as JPEG (quality 92) — always `.jpg`, regardless of input extension, since
+    `cv2.imwrite` cannot encode HEIC.
+
+### Known bug, not yet fixed
+
+Step 8's rotation fallback `_ocr_is_vertical()` compares the OCR bounding box's vertical extent
+to its horizontal extent, and rotates when the former is larger. That is true of any portrait
+parchment — most mezuzot — whose lines already run horizontally, so those get wrongly rotated
+90°. The correct signal is the direction the text *lines* run, not the shape of the text block.
+Suspected cause of the rotate category scoring 105.2% error rate (more errors than words) in the
+company's July 2026 comparison report.
 
 ### Key constants
 
