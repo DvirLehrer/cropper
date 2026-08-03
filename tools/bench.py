@@ -267,6 +267,12 @@ class ScoreRecord:
     # cannot be fooled that way — invented text simply fails to match.
     text_match_pct: float = 0.0
     ocr_chars: int = 0
+    # A fingerprint of *which* faults were reported, not merely how many.
+    # Counting by type would call it unchanged if a touching-letter moved from
+    # the third word to the seventh, and the product's whole purpose is telling
+    # a scribe which letter is wrong. Each entry is line/word/letter position,
+    # the letter itself and the fault, so two passes can be compared exactly.
+    error_fingerprint: list = field(default_factory=list)
 
 
 def _load_stam_ocr(stam_ocr_dir: Path):
@@ -320,6 +326,41 @@ def _walk_letters(result: dict):
                 yield word, letter
 
 
+_EXC_LINE = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Warning|Interrupt)\b.*)$")
+
+
+def _blame(stderr_text: str) -> str:
+    """The exception line out of whatever the engine printed while failing.
+
+    Not simply the last line: `StamOcr.create_scan` does
+    `print(traceback.print_exc(), file=sys.stderr)`, and since print_exc writes
+    the traceback and then returns None, the final line on stderr is the word
+    "None". Taking the last line reports that, which is how the first attempt at
+    this produced 'create_scan returned None: None' for every failure.
+    """
+    lines = [ln.strip() for ln in stderr_text.splitlines() if ln.strip()]
+    for i in range(len(lines) - 1, -1, -1):
+        m = _EXC_LINE.match(lines[i])
+        if not m:
+            continue
+        # The frame just above the exception is where it was actually raised —
+        # without it, "AttributeError: 'NoneType' has no attribute 'contours'"
+        # could be any of thirteen places in their code, and none of them worth
+        # patching on a guess.
+        where = ""
+        for j in range(i - 1, -1, -1):
+            f = re.match(r'File "([^"]+)", line (\d+), in (\S+)', lines[j])
+            if f:
+                where = f" at {Path(f.group(1)).name}:{f.group(2)} in {f.group(3)}"
+                break
+        return m.group(1) + where
+    # No recognisable exception: fall back to the last line that carries content.
+    for ln in reversed(lines):
+        if ln not in {"None", "e"} and not ln.startswith(("File ", "Traceback")):
+            return ln
+    return "no traceback captured"
+
+
 class _Timeout(Exception):
     pass
 
@@ -368,8 +409,15 @@ def score_one(engine, image_path: Path, model_name: str, type_scan: str,
     sha = sha256_file(image_path)
     rec = ScoreRecord(sha=sha, ok=False)
     t0 = time.perf_counter()
+    # create_scan catches almost everything and returns None, printing the real
+    # traceback to stderr on its way. Without capturing that, every distinct
+    # failure looks identical and there is nothing to act on.
+    import contextlib
+    import io
+
+    err = io.StringIO()
     try:
-        with _deadline(timeout):
+        with _deadline(timeout), contextlib.redirect_stderr(err):
             scan = engine.create_scan(
                 f"{sha[:16]}.jpg", str(image_path), "./bot", model_name, type_scan, 0
             )
@@ -384,8 +432,7 @@ def score_one(engine, image_path: Path, model_name: str, type_scan: str,
     rec.seconds = time.perf_counter() - t0
 
     if scan is None:
-        # create_scan swallows most exceptions and returns None.
-        rec.error = "create_scan returned None"
+        rec.error = f"create_scan returned None: {_blame(err.getvalue())}"[:300]
         return rec
 
     reference = getattr(scan.compare_data_module, "reference_text", "") or ""
@@ -412,6 +459,19 @@ def score_one(engine, image_path: Path, model_name: str, type_scan: str,
         rec.error = "result_json unparseable"
         return rec
 
+    fingerprint = []
+    for li, line in enumerate(result.get("lines") or []):
+        for wi, word in enumerate(line.get("words") or []):
+            wt = word.get("error_type") or ""
+            if wt:
+                fingerprint.append(f"{li}.{wi}|{word.get('orig_text') or ''}|{wt}")
+            for xi, letter in enumerate(word.get("letters") or []):
+                lt = letter.get("error_type") or ""
+                if lt:
+                    fingerprint.append(
+                        f"{li}.{wi}.{xi}|{letter.get('orig_text') or letter.get('ocr_text') or ''}|{lt}")
+    rec.error_fingerprint = fingerprint
+
     by_type: dict[str, int] = {}
     for word, letter in _walk_letters(result):
         if letter is None:
@@ -435,7 +495,8 @@ def score_one(engine, image_path: Path, model_name: str, type_scan: str,
 
 def stage_score(run_dir: Path, stam_ocr_dir: Path, model_name: str,
                 type_scan: str, limit: int | None, bench: Path | None = None,
-                timeout: int = 120) -> None:
+                timeout: int = 120, cache_file: Path | None = None,
+                force: bool = False) -> None:
     """Score the crops, and optionally the untouched originals.
 
     Scoring the originals is what answers the only question the company
@@ -443,9 +504,11 @@ def stage_score(run_dir: Path, stam_ocr_dir: Path, model_name: str,
     crop, and how many with it. Both go into the same cache, keyed by file
     content, so nothing is scored twice.
     """
-    cache_path = run_dir.parent / "score_cache.jsonl"
+    # A separate cache keeps an experiment from overwriting the baseline it is
+    # meant to be compared against.
+    cache_path = cache_file or (run_dir.parent / "score_cache.jsonl")
     cache: dict[str, dict] = {}
-    if cache_path.exists():
+    if cache_path.exists() and not force:
         with cache_path.open(encoding="utf-8") as fh:
             for line in fh:
                 if line.strip():
@@ -455,6 +518,12 @@ def stage_score(run_dir: Path, stam_ocr_dir: Path, model_name: str,
                     # ends up blank — or worse, half measured one way and half
                     # another. Anything missing a required field is re-scored.
                     if any(f not in row for f in REQUIRED_SCORE_FIELDS):
+                        continue
+                    # A failure is not worth caching. It is cheap to repeat,
+                    # there are few of them, and the reason we record for one
+                    # may improve as the instrumentation does — which is exactly
+                    # what happened here.
+                    if not row.get("ok"):
                         continue
                     cache[row["sha"]] = row
 
@@ -780,6 +849,10 @@ def main() -> int:
                     help="skip scoring the untouched originals")
     ap.add_argument("--timeout", type=int, default=120,
                     help="give up on a single scan after N seconds (0 disables)")
+    ap.add_argument("--cache", type=Path,
+                    help="write scores to this file instead of the shared cache")
+    ap.add_argument("--force", action="store_true",
+                    help="re-score everything, ignoring what is cached")
     ap.add_argument("--set", type=Path,
                     help="restrict to a dev-set file (see tools/make_devset.py)")
     args = ap.parse_args()
@@ -790,7 +863,7 @@ def main() -> int:
         stage_crop(args.benchmark, run_dir, args.model, args.only, _load_set(args.set))
     elif args.stage == "score":
         stage_score(run_dir, args.stam_ocr, args.ocr_model, args.type_scan,
-                    args.limit, bench, args.timeout)
+                    args.limit, bench, args.timeout, args.cache, args.force)
     else:
         stage_report(run_dir, args.runs_dir / args.vs if args.vs else None, bench)
     return 0

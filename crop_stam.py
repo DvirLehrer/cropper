@@ -5,7 +5,7 @@ crop_stam.py — Production CLI: crop STaM manuscript images to the text region.
 For each input image:
   1. YOLO segmentation + Google Vision OCR run in parallel
   2. OCR boxes in text clusters adjacent to the model polygon are included
-  3. Union of model polygon and OCR convex hull = final boundary
+  3. Union of model polygon and the outline of those characters = final boundary
   4. Outside the boundary is filled with the sampled parchment background colour
   5. Image is cropped to the boundary bounding box and saved
 
@@ -14,6 +14,10 @@ Usage:
   python3 crop_stam.py --images-dir images/benchmark --out-dir test_output/cropped
   python3 crop_stam.py --images-dir images/before_crop --model best.pt
 """
+# Type annotations are evaluated lazily so that `X | None` and friends parse on
+# Python 3.9, which is what `python3` still is on this machine.
+from __future__ import annotations
+
 import argparse
 import math
 import os
@@ -54,7 +58,8 @@ def active_settings() -> dict:
     return {n: globals()[n] for n in (
         "CONF", "OCR_MAX_PIXELS", "CLUSTER_GAP_PCT", "MODEL_REACH_PCT",
         "ROTATE_RATIO", "DESKEW_MIN_DEG", "MARGIN_CHARS", "TEXT_REACH_CHARS",
-        "MODEL_LEASH_CHARS", "FLATTEN_BG", "DERULE",
+        "MODEL_LEASH_CHARS", "FLATTEN_BG", "ROUGH_MIN", "CLIP_TO_SHEET", "USE_TEXT_REGION",
+        "RESEG_AFTER_DESKEW", "RESEG_MIN_DEG", "MODEL_MAX_RATIO", "DERULE",
     )}
 
 
@@ -73,6 +78,22 @@ DESKEW_MIN_DEG  = _tune('DESKEW_MIN_DEG', 0.5)         # below this the image is
 MARGIN_CHARS    = _tune('MARGIN_CHARS', 0.0)         # crop margin, in median character heights.
                               # Held at 0 until the text-region change below is
                               # measured on its own; it has never been isolated.
+# Outline the accepted characters rather than taking their convex hull.
+#
+# Off, and the story is worth keeping. A convex hull lets one stray character
+# box drag the outline out and swallow the triangle in between, which is what
+# filled the crops of slanted parchment with table, so outlining the characters
+# was worth +3.7 points of text when it was introduced.
+#
+# Straightening the image before segmentation then removed the cause: text that
+# has been levelled has a hull that is a tight rectangle, with no triangles to
+# swallow. Measured with that in place, the hull is the better of the two —
+# -0.9 text but +4.7 on the under-20 rule and half the errors — because
+# outlining the characters fills the gaps between the lines with background and
+# hands the engine a page cut into stripes.
+#
+# A workaround that outlived the problem it worked around.
+USE_TEXT_REGION = _tune('USE_TEXT_REGION', False)
 TEXT_REACH_CHARS = _tune('TEXT_REACH_CHARS', 0.6)        # dilation around each character when outlining
                               # the text region, in character heights
 # Limiting how far the model polygon may reach past the recognised text looked
@@ -90,6 +111,24 @@ MODEL_LEASH_CHARS = _tune('MODEL_LEASH_CHARS', 0.0)
 # ADDED_LETTER, which is exactly the signature of over-processing, so it is now
 # a flag and gets tested like everything else.
 FLATTEN_BG      = _tune('FLATTEN_BG', True)
+# Confining the crop to the bright sheet was tried and abandoned unmeasured, on
+# the reasonable objection that if a brightness threshold could separate sheet
+# from surface it would have been the first cropping algorithm anyone wrote —
+# and this pipeline uses a trained model precisely because it cannot. It breaks
+# on dark parchment, a pale table, a shadow across the sheet, an overexposed
+# photo, or a scan on white paper. The code stays for reference; the default is
+# off, and it should not be turned on without a measurement behind it.
+CLIP_TO_SHEET   = _tune('CLIP_TO_SHEET', False)
+# Re-run segmentation after straightening the image, so the model's low-resolution
+# mask meets a sheet whose edges run with the pixel grid instead of across it.
+# Costs one extra inference, and only on images slanted enough to matter.
+RESEG_AFTER_DESKEW = _tune('RESEG_AFTER_DESKEW', True)
+RESEG_MIN_DEG   = _tune('RESEG_MIN_DEG', 2.0)
+# Discard the model polygon when it exceeds the text region by this factor.
+# Measured: a sound detection sits near 1x, a failed one reached 6.4x.
+MODEL_MAX_RATIO = _tune('MODEL_MAX_RATIO', 3.0)
+ROUGH_MIN       = _tune('ROUGH_MIN', 0.0)   # flatten only above this roughness;
+                                            # 0 = flatten everything, as before
 # Ruled-line suppression (deruling.py). The first ungated version was a large
 # win where the parchment really is ruled — drawings 13.0% -> 26.1% of images
 # under the 20-error line, roughness 44.4% -> 50.0% with nothing made worse —
@@ -233,6 +272,143 @@ def adjacent_ocr_corners(boxes: list, model_mask: np.ndarray, H: int, W: int):
     return (np.array(pts, dtype=np.float32) if pts else None), accepted
 
 
+def text_angle(boxes: list) -> float | None:
+    """Directed baseline angle of the writing, in degrees. None if no OCR.
+
+    Depends on the OCR alone — the segmentation model plays no part — which is
+    what allows the image to be straightened before the model ever sees it.
+    """
+    rad = []
+    for b in boxes:
+        v = b.get('vertices') or []
+        if len(v) < 4:
+            continue
+        dx, dy = v[1]['x'] - v[0]['x'], v[1]['y'] - v[0]['y']
+        if dx or dy:
+            rad.append(math.atan2(dy, dx))
+    if not rad:
+        return None
+    a = np.array(rad)
+    return math.degrees(math.atan2(np.sin(a).mean(), np.cos(a).mean()))
+
+
+def _rotate_about_centre(img: np.ndarray, deg: float, fill):
+    """Rotate so nothing is lost. Returns (image, 2x3 matrix used)."""
+    H, W = img.shape[:2]
+    M = cv2.getRotationMatrix2D((W / 2.0, H / 2.0), deg, 1.0)
+    cos, sin = abs(M[0, 0]), abs(M[0, 1])
+    nW, nH = int(H * sin + W * cos), int(H * cos + W * sin)
+    M[0, 2] += nW / 2.0 - W / 2.0
+    M[1, 2] += nH / 2.0 - H / 2.0
+    out = cv2.warpAffine(img, M, (nW, nH), flags=cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=fill)
+    return out, M
+
+
+def _apply_to_boxes(boxes: list, M: np.ndarray) -> list:
+    """Move OCR character quads into a rotated frame."""
+    moved = []
+    for b in boxes:
+        verts = b.get('vertices') or []
+        if not verts:
+            moved.append(b)
+            continue
+        pts = np.array([[[v['x'], v['y']]] for v in verts], dtype=np.float32)
+        out = cv2.transform(pts, M).reshape(-1, 2)
+        moved.append({**b, 'vertices': [{'x': int(round(x)), 'y': int(round(y))}
+                                        for x, y in out]})
+    return moved
+
+
+def parchment_mask(img: np.ndarray, seed: np.ndarray) -> np.ndarray | None:
+    """The sheet the writing sits on, as a mask. None if it cannot be found.
+
+    Why this exists: the model's mask comes back at a fraction of the image
+    resolution and is upscaled, so its edges are a staircase aligned to the
+    pixel grid. When the parchment lies at an angle — which is the whole of the
+    rotate challenge — a staircase cannot follow a straight diagonal edge, and
+    each step swallows a square of table. Deskewing afterwards straightens the
+    writing and carries those squares along with it, which is why the corners of
+    those crops are full of wood.
+
+    Restricting the boundary by *brightness* rather than by proximity to
+    recognised text is what makes this safe. Text the OCR missed is still text
+    on a bright sheet, so it survives — the earlier attempt to leash the model
+    to the recognised characters cost perspective 93.8% -> 70.5% for exactly
+    that reason.
+
+    `seed` marks pixels known to be on the sheet: the writing itself.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    scale = min(1.0, 1400 / max(gray.shape))
+    small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) \
+        if scale < 1.0 else gray
+    seed_small = cv2.resize(seed, (small.shape[1], small.shape[0]),
+                            interpolation=cv2.INTER_NEAREST)
+    if cv2.countNonZero(seed_small) < 20:
+        return None
+
+    # The sheet is whatever is brighter than the midpoint between the writing
+    # and the surface it was photographed on. Otsu finds that split directly.
+    thresh, sheet = cv2.threshold(small, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Close over the writing so letters do not punch holes in their own sheet.
+    span = max(3, int(min(small.shape) * 0.02))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*span+1, 2*span+1))
+    sheet = cv2.morphologyEx(sheet, cv2.MORPH_CLOSE, k)
+
+    n, labels = cv2.connectedComponents(sheet)
+    if n <= 1:
+        return None
+    # Keep every component the writing actually touches: a torn or folded sheet
+    # can read as more than one.
+    keep = set(np.unique(labels[seed_small > 0])) - {0}
+    if not keep:
+        return None
+    out = np.isin(labels, list(keep)).astype(np.uint8) * 255
+    if scale < 1.0:
+        out = cv2.resize(out, (gray.shape[1], gray.shape[0]),
+                         interpolation=cv2.INTER_NEAREST)
+    return out
+
+
+def parchment_roughness(bgr: np.ndarray) -> float:
+    """How grainy the parchment is, on a scale where ~1.0 is visibly rough.
+
+    Texture is measured only on the parchment — ink is excluded, since strokes
+    are high-frequency by nature and would swamp the reading — as the spread of
+    each pixel around its local neighbourhood. That is then divided by the
+    image's own ink-to-parchment contrast, so a dim photo and a bright scan of
+    the same skin give the same answer.
+
+    Flattening exists to suppress this grain and does so well: on the rough
+    parchment folder it is worth +16.5 points of text recovered. Everywhere else
+    it costs — rotate -12.5, cropper -2.1, perspective -1.7 — because it is
+    smoothing a surface that was not the problem. Hence measuring first.
+    """
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    scale = min(1.0, 1200 / max(gray.shape))
+    if scale < 1.0:
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+    thresh, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    parchment = gray > thresh
+    if parchment.sum() < 500:
+        return 0.0
+
+    g = gray.astype(np.float32)
+    local = cv2.blur(g, (7, 7))
+    detail = np.abs(g - local)[parchment]
+    # Median absolute deviation, not the mean: a few specks or a stray hair
+    # should not read as a rough surface.
+    grain = float(np.median(detail)) * 1.4826
+
+    ink = gray[gray <= thresh]
+    contrast = float(np.median(gray[parchment]) - np.median(ink)) if ink.size else 0.0
+    if contrast < 10:
+        return 0.0
+    return round(grain / contrast * 20.0, 3)
+
+
 def _text_region(boxes: list, accepted: set, adj_pts, H: int, W: int):
     """Outline of the accepted characters — the text's own shape, not its hull.
 
@@ -251,6 +427,8 @@ def _text_region(boxes: list, accepted: set, adj_pts, H: int, W: int):
     """
     if adj_pts is None or not accepted:
         return None
+    if not USE_TEXT_REGION:
+        return cv2.convexHull(adj_pts).reshape(-1, 2)
 
     heights = []
     for i in accepted:
@@ -322,8 +500,6 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
         return False
 
     H, W  = img.shape[:2]
-    ratio = max(W, H) / min(W, H)
-    imgsz = _imgsz_for(W, H)
 
     # Segmentation + OCR in parallel.
     # Both branches receive the SAME decoded array, never the path: handing a
@@ -332,22 +508,51 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
     # image tagged orientation=6 that put the model polygon in a frame rotated
     # 90° from the OCR boxes. Passing the array also avoids decoding the file
     # three times, and is the only way HEIC input reaches the model at all.
-    def _seg():
-        poly = _predict(model, img, conf, imgsz)
-        if poly is not None and ratio > SPLIT_RATIO:
-            span = (poly[:, 0].max() - poly[:, 0].min()) if W >= H \
+    def _seg(on, iw, ih):
+        r = max(iw, ih) / max(1, min(iw, ih))
+        poly = _predict(model, on, conf, _imgsz_for(iw, ih))
+        if poly is not None and r > SPLIT_RATIO:
+            span = (poly[:, 0].max() - poly[:, 0].min()) if iw >= ih \
                    else (poly[:, 1].max() - poly[:, 1].min())
-            if span < max(W, H) * 0.70:
-                poly = _tiled_predict(model, img, conf)
-        elif poly is None and ratio > SPLIT_RATIO:
-            poly = _tiled_predict(model, img, conf)
+            if span < max(iw, ih) * 0.70:
+                poly = _tiled_predict(model, on, conf)
+        elif poly is None and r > SPLIT_RATIO:
+            poly = _tiled_predict(model, on, conf)
         return poly
 
     with ThreadPoolExecutor(max_workers=2) as ex:
-        f_seg = ex.submit(_seg)
+        f_seg = ex.submit(_seg, img, W, H)
         f_ocr = ex.submit(run_ocr, img)
         poly_model = f_seg.result()
         ocr_boxes  = f_ocr.result()
+
+    # Straighten before segmenting again, when the writing is slanted.
+    #
+    # The model returns its mask at a fraction of the image resolution, so its
+    # edges are a staircase on the pixel grid. A staircase sits neatly along an
+    # axis-aligned sheet edge and badly along a diagonal one, where every step
+    # swallows a square of whatever the parchment was lying on — which is why
+    # the corners of the rotate crops are full of table.
+    #
+    # The angle comes from the OCR alone, so the image can be levelled first and
+    # the model given a sheet whose edges run with the grid. The cost is that
+    # segmentation can no longer overlap the Vision call, so it is paid only
+    # when there is something to gain: 96% of scans measure within half a degree
+    # of straight and take the parallel path unchanged.
+    theta = text_angle(ocr_boxes)
+    pre_rotated = False
+    if (RESEG_AFTER_DESKEW and theta is not None
+            and abs(theta) >= RESEG_MIN_DEG and ocr_boxes):
+        bg_guess = tuple(int(c) for c in np.median(
+            img.reshape(-1, 3)[::97], axis=0))
+        rot, M = _rotate_about_centre(img, theta, bg_guess)
+        rot_boxes = _apply_to_boxes(ocr_boxes, M)
+        rH, rW = rot.shape[:2]
+        rot_poly = _seg(rot, rW, rH)
+        if rot_poly is not None:
+            img, ocr_boxes, poly_model = rot, rot_boxes, rot_poly
+            H, W = rH, rW
+            theta, pre_rotated = 0.0, True
 
     model_mask = None
     if poly_model is not None:
@@ -357,6 +562,29 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
     # Extend OCR to adjacent text clusters, then wrap the accepted characters.
     adj_pts, accepted = adjacent_ocr_corners(ocr_boxes, model_mask, H, W)
     ocr_hull = _text_region(ocr_boxes, accepted, adj_pts, H, W)
+
+    # Distrust a model polygon that dwarfs the writing it is supposed to bound.
+    #
+    # On a sound detection the two are comparable — one benchmark image measures
+    # 13.3% of the frame for the model against 14.8% for the text, and the model
+    # earns its keep by reaching slightly further and catching letters the OCR
+    # missed. On a failed one the model claimed 82.6% of the frame while the
+    # text occupied 13.0%, and the crop came back larger than the photo.
+    #
+    # Clipping the model back to the text on *every* image was tried and cost
+    # perspective 93.8% -> 70.5%, because the area past the recognised
+    # characters is usually real text. So the rule fires only at the extreme,
+    # where no reading of the picture supports keeping it.
+    if (poly_model is not None and ocr_hull is not None
+            and MODEL_MAX_RATIO > 0 and model_mask is not None):
+        text_mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(text_mask, [ocr_hull.astype(np.int32)], 255)
+        text_area = cv2.countNonZero(text_mask)
+        model_area = cv2.countNonZero(model_mask)
+        if text_area > 0 and model_area > MODEL_MAX_RATIO * text_area:
+            print(f'  model discarded: {100*model_area/(H*W):.0f}% of frame vs '
+                  f'{100*text_area/(H*W):.0f}% of text')
+            poly_model, model_mask = None, None
 
     # Union polygon.
     #
@@ -417,6 +645,25 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
     union_mask = np.zeros((H, W), dtype=np.uint8)
     cv2.fillPoly(union_mask, [boundary.astype(np.int32)], 255)
 
+    # Clip to the sheet, so nothing the model annexed from the table survives.
+    if CLIP_TO_SHEET and ocr_hull is not None:
+        seed = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(seed, [ocr_hull.astype(np.int32)], 255)
+        sheet = parchment_mask(img, seed)
+        if sheet is not None:
+            clipped = cv2.bitwise_and(union_mask, sheet)
+            # Only accept the clip if the sheet was actually found: losing most
+            # of the region means the brightness split went wrong, and the
+            # original boundary is the safer answer.
+            if cv2.countNonZero(clipped) > 0.5 * cv2.countNonZero(union_mask):
+                union_mask = clipped
+                cnts, _ = cv2.findContours(union_mask, cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+                if cnts:
+                    boundary = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+                    union_mask = np.zeros((H, W), dtype=np.uint8)
+                    cv2.fillPoly(union_mask, [boundary.astype(np.int32)], 255)
+
     margin = _margin_px(ocr_boxes, H, W)
     if margin > 0:
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*margin+1, 2*margin+1))
@@ -442,22 +689,10 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
     # This subsumes that rule: a parchment photographed vertically simply has a
     # ~90° text angle and is rotated by exactly that, satisfying criterion 3 as
     # a special case rather than as a separate branch.
-    def _text_angle():
-        """Directed baseline angle of the OCR characters in degrees, or None."""
-        rad = []
-        for b in ocr_boxes:
-            v = b.get('vertices') or []
-            if len(v) < 4:
-                continue
-            dx, dy = v[1]['x'] - v[0]['x'], v[1]['y'] - v[0]['y']
-            if dx or dy:
-                rad.append(math.atan2(dy, dx))
-        if not rad:
-            return None
-        a = np.array(rad)
-        return math.degrees(math.atan2(np.sin(a).mean(), np.cos(a).mean()))
-
-    theta = _text_angle()
+    # theta was computed above, before the optional re-segmentation; if the
+    # image was straightened there it is now 0 and this step is a plain crop.
+    if not pre_rotated:
+        theta = text_angle(ocr_boxes)
 
     if theta is not None and abs(theta) >= DESKEW_MIN_DEG:
         # Rotate and crop in one warp: no full-size intermediate, and the corners
@@ -491,7 +726,9 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
     # Background contrast reduction: only on large, roughly square images.
     # Skipped for low-res (strokes too thin) and high-ratio (elongated strips).
     _ch, _cw = cropped.shape[:2]
-    if FLATTEN_BG and min(_ch, _cw) >= 500 and max(_ch, _cw) / min(_ch, _cw) <= 4:
+    _rough = parchment_roughness(cropped) if FLATTEN_BG else 0.0
+    if (FLATTEN_BG and _rough >= ROUGH_MIN
+            and min(_ch, _cw) >= 500 and max(_ch, _cw) / min(_ch, _cw) <= 4):
         lab       = cv2.cvtColor(cropped, cv2.COLOR_BGR2LAB)
         l, a, b   = cv2.split(lab)
         thresh, _ = cv2.threshold(l, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)

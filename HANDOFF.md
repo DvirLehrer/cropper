@@ -66,19 +66,105 @@ Put plainly: the engine fails outright on 47% of real customer photos and on 13%
 after our crop. It rescued 57 images and broke 3. Neither number depends on any
 definition anyone could argue about.
 
-Per challenge, text recovered (dev set):
+Per challenge, text recovered on the 43-image dev set, as the settings changed:
 
-| | ours |
-|---|---|
-| general | 99.3% |
-| perspective | 90.6% |
-| drawings | 90.7% |
-| objects | 93.5% |
-| cropper | 84.3% |
-| **roughness** | **51.5%** |
-| **rotate** | **51.3%** |
+| | first measured | best so far |
+|---|---|---|
+| rotate | 51.3% | **91.8%** |
+| objects | 93.5% | 91.8% |
+| drawings | 90.7% | 88.8% |
+| cropper | 84.3% | 86.3% |
+| general | 99.3% | 85.2% |
+| perspective | 90.6% | 82.0% |
+| **roughness** | 51.5% | **51.6%** |
+| **overall** | 77.5% | **82.3%** |
 
-Roughness and rotate are the whole remaining problem.
+The best configuration:
+
+    RESEG_AFTER_DESKEW=1  ROUGH_MIN=1.2  MODEL_MAX_RATIO=0
+
+Roughness is now the whole remaining problem — the engine reads barely half the
+text on grainy parchment. Perspective gave up 7.8 points to the rotate fix and
+is worth one experiment: `RESEG_MIN_DEG` decides how slanted an image must be
+before it is straightened, and perspective images are only mildly slanted while
+the rotate ones sit at 25-53°.
+
+Note that the headline table above was measured on all 157 with an earlier
+configuration. Re-run the full set before quoting numbers to anyone.
+
+## Three crashes in the scoring engine, and what they cost
+
+Fourteen of the 157 images produced no report at all — 9% of the benchmark, and
+a third of the rough-parchment folder. Every one of them died inside Stam-OCR,
+not in the cropper, and no crop could have prevented it: the crashes depend on
+where a letter sits in the text, not on the quality of the picture.
+
+| where | fault | images |
+|---|---|---|
+| `Utils/MyDiffLib.py:831` `fix_touching_letter_v` | `KeyError: -1` | 8 |
+| `PolygonsList.py:100` `union` | `AttributeError: 'NoneType' … contours` | 5 |
+| `ShowResults.py:474` `fix_l_swallowing` | `IndexError` | 1 |
+
+All three are an index that is not there. The first is the clearest: `i` runs
+over `[0, 1]` and says *which of the two lines a letter spans*, while the line
+numbers themselves are in `lines_idxs` — but one line reads
+`polygons_data.lines[i - 1]`, so at `i == 0` it asks a dict for key `-1`. At
+`i == 1` it does not crash; it reads line 0, which is not the line the letter
+touches either.
+
+Measured by patching only enough to stop the crashes, changing no decision the
+code makes, and re-scoring all 157 twice (`tools/patch_engine.py`,
+`tools/compare_scores.py`):
+
+    identical verdict      143      same faults, same letters, same places
+    rescued                 14
+    verdict changed          0
+
+    engine returned a result   91.1%  ->  100%
+    text recovered             79.5%  ->  86.1%
+    roughness                  54.6%  ->  75.2%
+
+The engine's files were restored afterwards; nothing is patched in the repo.
+
+Two things follow. Roughness was never a texture problem — a morning went into
+grain detection and suppression before it turned out those images were not being
+read at all. And the cropper's ceiling is higher than the numbers suggest: 6.6
+points of the gap are not ours to close.
+
+## The rotate fix: segment after straightening, not before
+
+The single largest improvement, and the one that took longest to find because
+three plausible explanations were wrong first.
+
+The model was being handed the photograph as it arrived. On a tefilin strip
+lying at 53° it did not find the strip at all — it marked **82.6% of the frame**,
+essentially the whole background, at a confidence of 0.43. Straighten the image
+first, using the angle of the writing, and the same model on the same photograph
+marks **5.3%**, tight around the strip.
+
+The cause is mundane: the model was trained on horizontal writing, so a steeply
+angled strip is outside anything it has seen. Level it and the picture is
+ordinary again.
+
+    RESEG_AFTER_DESKEW=1     rotate 60.4% -> 91.8% text recovered
+                             overall 78.4% -> 82.3%
+
+The angle is measured from the OCR alone, so nothing circular happens: OCR gives
+the angle, the angle straightens the image, the model then sees it. The cost is
+that segmentation can no longer run in parallel with the Vision call, so it is
+paid only above `RESEG_MIN_DEG`; 96% of scans are within half a degree of
+straight and take the old parallel path untouched.
+
+Wrong explanations, recorded so they are not re-derived:
+
+- *The model merges several masks and one of them is spurious.* It returned one
+  mask.
+- *A low-resolution mask cannot follow a diagonal sheet edge, so it swallows
+  squares of table.* Simulated at the model's actual mask resolution: 0.6-1.3%
+  of extra area at any angle. Far too small to matter.
+- *A crop larger than the photograph means the boundary leaked outward.* It
+  means the boundary already covered most of the frame and deskewing rotated its
+  bounding box. The arithmetic matches exactly.
 
 ## What was tried, and what the numbers said
 

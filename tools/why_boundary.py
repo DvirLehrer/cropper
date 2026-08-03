@@ -55,6 +55,27 @@ def main() -> int:
             poly = _tiled_predict(model, img, crop_stam.CONF)
         return poly
 
+    def _raw_detections():
+        """Every mask the model returned, before _predict ORs them together.
+
+        _predict merges all of them into one region. One sound detection on the
+        parchment plus a spurious one on the table is enough to make the merged
+        region swallow the frame, which would explain why the failure clusters
+        on photographs of a sheet lying on a surface rather than on flat scans.
+        """
+        r = model.predict(img, imgsz=imgsz, conf=crop_stam.CONF, verbose=False)[0]
+        if r.masks is None or not len(r.masks):
+            return []
+        confs = (r.boxes.conf.tolist() if r.boxes is not None else [None] * len(r.masks))
+        out = []
+        for i, poly in enumerate(r.masks.xy):
+            m = np.zeros((H, W), np.uint8)
+            if len(poly) >= 3:
+                cv2.fillPoly(m, [poly.astype(np.int32)], 255)
+            out.append((confs[i] if i < len(confs) else None,
+                        100.0 * int(cv2.countNonZero(m)) / (H * W)))
+        return out
+
     with ThreadPoolExecutor(max_workers=2) as ex:
         f_seg, f_ocr = ex.submit(_seg), ex.submit(crop_stam.run_ocr, img)
         poly_model, ocr_boxes = f_seg.result(), f_ocr.result()
@@ -85,6 +106,13 @@ def main() -> int:
 
     print(f"\nimage            {Path(args.image).name}   {W}x{H}")
     print(f"OCR characters   {len(ocr_boxes)} found, {len(accepted)} accepted into the hull")
+
+    dets = _raw_detections()
+    print(f"\nmodel returned   {len(dets)} mask(s)"
+          + ("   — _predict merges them all into one region" if len(dets) > 1 else ""))
+    for i, (conf, area) in enumerate(sorted(dets, key=lambda d: -(d[1] or 0)), 1):
+        print(f"   mask {i}: {area:>5.1f}% of frame"
+              + (f"   confidence {conf:.2f}" if conf is not None else ""))
     print(f"\n{'model polygon':<24}{pct(model_mask):>7.1f}% of frame")
     print(f"{'OCR hull':<24}{pct(hull_mask):>7.1f}%")
     print(f"{'model OR hull':<24}{pct(inputs):>7.1f}%   <- the boundary should equal this")
