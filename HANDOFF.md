@@ -289,18 +289,19 @@ hybrid or toward cropper #2 if the cloud call were unacceptable. The company has
 since confirmed the dependency is fine. That removes the only blocker no amount
 of code could fix, and makes this repo the candidate to finish.
 
-## The blockers, as of today
+## The blockers, and where each one ended
 
 | # | Blocker | Status |
 |---|---|---|
-| 1 | Rotate — 105.2% error rate, worse than useless | mechanism replaced, unmeasured |
-| 2 | Roughness — 47.5%, worst of all four versions | untouched |
-| 3 | `NO_DETECTION` on 10 images, a failure mode the Tesseract-based versions cannot have | our sweep returned 157/157, unverified |
-| 4 | Basic crop clips letters — 26% errors on the crop folder, worst of four, despite 100% "success" | diagnosed, not fixed |
+| 1 | Rotate — 105.2% error rate, worse than useless | fixed: baseline angle, then re-segment. 87.3% text |
+| 2 | Roughness — 47.5%, worst of all four versions | fixed: gated non-local means. 75.2% → 81.7% |
+| 3 | `NO_DETECTION` on 10 images | was three crashes in their engine, not ours. Patched; 156/157 now return |
+| 4 | Basic crop clips letters | measured: the crop loses more than 2% of characters on 1 image of 157. Margin and text-region outline both made it worse and stay off |
 | ~~5~~ | ~~Google Vision dependency~~ | accepted by the company |
+| 6 | Perspective | still not implemented — see below |
 
-Note that (4) is ours, not theirs: their report never separated it out, because
-their success metric could not see it.
+Note that (4) was ours, not theirs: their report never separated it out, because
+their success metric could not see it. It turned out not to be a real problem.
 
 ## Design principle: detect, then treat
 
@@ -473,11 +474,19 @@ is auto-detected. Uniform auto-detection keeps every image on the same footing.
 - **The "preselected image set" in criterion 1 is undefined.** Freezing the 157
   matters for engineering reasons regardless: without a stable set, a change
   cannot be attributed to the code rather than to the test set.
-- **Roughness** has had no analysis yet. The hypothesis in their report is that
-  our Otsu threshold plus background fill amplifies grain instead of smoothing
-  it, which would make the flattening step in `crop_image()` the place to look.
 - **Objects has only 9 images**, so each one is worth 11% — too small to support
   any threshold. Worth asking for more magnet/tape samples.
+- **Perspective correction does not exist.** The folder scores 86.8%, so it is
+  not urgent, but criterion 2 asks for it. The polygon is already computed;
+  `approxPolyDP` to a quadrilateral plus one `warpPerspective` is tens of
+  milliseconds on data we already have. The reason to be careful: perspective
+  images are the ones the denoiser damaged at a lower threshold, so whatever is
+  distinctive about them is easy to get wrong.
+- **Ruled-line suppression is written and switched off.** `deruling.py` finds a
+  periodic line by autocorrelation and subtracts it. It is worth 0.1 points and
+  is not enabled. Re-tested after the denoiser went in, on the theory that a
+  clean sheet makes the ruling easier to find; it did not change. Do not delete
+  it — the drawings folder is at 81.0% and this is the most likely lever.
 
 ## How we measure: ourselves against ourselves
 
@@ -513,20 +522,30 @@ rebuilds it every 10 images, so it can be opened mid-sweep.
 Numbers alone will not catch a crop that is subtly wrong on every image. Look at
 the sheet after each run.
 
+## Where each category finished
+
+Run `final3`, 157 images, share of the known reference text recovered:
+
+    01_cropper      87.9      04_objects      97.4
+    02_rotate       87.3      05_drawings     81.0
+    03_perspective  86.8      06_roughness    81.7
+                              00_general      96.1
+    ALL             86.6      under 20 errors 33.1      0.99 s
+
 ## Next steps, in order
 
-1. `./tools/setup_scoring_macos.sh`, then `pip install pillow-heif` in the normal
-   environment.
-2. Establish before/after as above. This is the first measurement anyone has run
-   since the changes; expect the first sweep to surface plumbing problems.
-3. Look at `current/index.html` and sanity-check the crops by eye.
-4. Then change algorithms, one challenge at a time, re-measuring each time:
-   - **crop clipping** — margin plus `expand_to_blobs`. Cheapest fix, worst
-     current standing, affects every category.
-   - **rotation and perspective together** — `minAreaRect` / `approxPolyDP` on
-     the polygon we already have.
-   - **roughness** — gate the flattening on measured grain instead of on crop
-     size.
-   - leave objects, drawings and general backgrounds alone except to confirm
-     they have not regressed; we already lead there and the headroom is a few
-     percent.
+1. **Send the engine patch.** `dist/stam-ocr-crash-fixes.zip` — three files, a
+   14-line diff, and the measurements. Without it the engine returns nothing on
+   14 of 157 images no matter what the cropper does. Verified as safe: 143
+   verdicts unchanged, 14 rescued, 0 altered.
+2. **Perspective**, as described under open items. The last contract criterion
+   with nothing behind it.
+3. **Drawings**, at 81.0% the weakest category. `deruling.py` is written and
+   switched off; that is where to start, but it needs a better detector rather
+   than a better threshold.
+4. Leave objects and general backgrounds alone except to confirm they have not
+   regressed. Both are above 96% and the headroom is a few points.
+
+Before changing anything: run `tools/bench.py` twice, once on the current tip and
+once on the change, and read the sheet. Every wrong conclusion in this file came
+from reasoning about the images instead of measuring them.
