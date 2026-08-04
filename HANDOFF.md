@@ -49,21 +49,63 @@ worst of all four versions in exactly two places:
 
 Those two are the job.
 
+## Denoising the parchment: the roughness fix
+
+Rough skin was the worst category by a wide margin, and neither of the obvious
+remedies worked. Averaging toward the background mean (`FLATTEN_BG`) evens out
+lighting, not grain. An edge-preserving bilateral filter can only judge a
+neighbour by how far apart two pixels are in brightness — and grain, at 7 to 13
+grey levels, occupies the same range as the soft edge of a faded stroke. Removing
+one erodes the other, in a straight line: 38-50% of the grain gone for 3.4-4.1
+grey levels of movement at the letter edges.
+
+Non-local means asks a different question — does this patch recur elsewhere in
+the picture? A stroke appears hundreds of times on a page of script and is
+reinforced; a speck appears once and averages away. The criterion is repetition
+rather than contrast, and a sheet of STaM is close to the ideal case for it.
+
+    bilateral, wide     38-50% of grain removed    edges moved 3.4-4.1
+    non-local means     65-78%                     edges moved 0.7-1.5
+
+    roughness folder, text recovered:  75.2%  ->  81.7%
+
+Three things had to be right, and each was wrong first:
+
+* **Where to measure.** Grain read over the whole crop is the grain of the table
+  the sheet was lying on. That put the rotate folder at a median of 14.1 against
+  roughness at 7.9, and had 79 of 157 images qualifying. Measured on the block of
+  writing instead, roughness leads at 6.3 and the ordering is sensible.
+* **When to fire.** At a threshold of 5 the filter also caught four perspective
+  images and destroyed them — that folder lost 13.1 points against 10.6 gained
+  on roughness. At 8 no perspective image qualifies.
+* **How wide to search.** Narrowing the search window from 21 to 11 is three
+  times faster and costs 5.7 points of text on the roughness folder. It is kept
+  at 21, and narrowed only above 4 MP, where the filter would otherwise take ten
+  seconds on a single image.
+
+Downscaling before filtering was tried as a cheaper route and abandoned: halving
+the image first is four times faster, but the resample alone moves letter edges
+by 5.6 grey levels against 1.5, which is the entire thing being avoided.
+
 ## Where this stands — measured, not estimated
 
 Everything below was measured with `tools/bench.py` against the company's own
 Stam-OCR engine, on the frozen 157-image benchmark (or the 43-image dev set
 where noted). The best configuration so far is the `region` run.
 
-**The two results that need no interpretation:**
+**The results that need no interpretation** (run `final3`, all 157 images, with
+the three engine crashes patched — without that patch the first row reads 91%):
 
 | | untouched photo | after our crop |
 |---|---|---|
-| the engine returns a result at all | 83/157 — 52.9% | **137/157 — 87.3%** |
-| of the known reference text, how much it read | 40.5% | **77.5%** |
+| the engine returns a result at all | 52.9% | **99.4%** |
+| of the known reference text, how much it read | 40.5% | **86.6%** |
+| 90% or more of the text recovered | — | **69.4%** |
+| fewer than 20 errors reported | 5.7% | **33.1%** |
+| the engine could not identify the document | — | 4 of 157 |
 
-Put plainly: the engine fails outright on 47% of real customer photos and on 13%
-after our crop. It rescued 57 images and broke 3. Neither number depends on any
+Median 0.99 s an image, against 3.51 s for the version in production and 6.94 s
+for the first delivery. Neither number depends on any
 definition anyone could argue about.
 
 Per challenge, text recovered on the 43-image dev set, as the settings changed:

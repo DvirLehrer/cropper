@@ -30,6 +30,7 @@ from google.cloud import vision
 from ultralytics import YOLO
 
 import deruling
+import texture
 from crop_with_model import _predict, _tiled_predict, _imgsz_for, SPLIT_RATIO
 from stam_io import imread_any, list_images
 
@@ -59,7 +60,8 @@ def active_settings() -> dict:
         "CONF", "OCR_MAX_PIXELS", "CLUSTER_GAP_PCT", "MODEL_REACH_PCT",
         "ROTATE_RATIO", "DESKEW_MIN_DEG", "MARGIN_CHARS", "TEXT_REACH_CHARS",
         "MODEL_LEASH_CHARS", "FLATTEN_BG", "ROUGH_MIN", "CLIP_TO_SHEET", "USE_TEXT_REGION",
-        "RESEG_AFTER_DESKEW", "RESEG_MIN_DEG", "MODEL_MAX_RATIO", "DERULE",
+        "RESEG_AFTER_DESKEW", "RESEG_MIN_DEG", "MODEL_MAX_RATIO",
+        "MIN_CHAR_PX", "MAX_UPSCALE", "GRAIN_MIN", "DERULE",
     )}
 
 
@@ -127,6 +129,21 @@ RESEG_MIN_DEG   = _tune('RESEG_MIN_DEG', 2.0)
 # Discard the model polygon when it exceeds the text region by this factor.
 # Measured: a sound detection sits near 1x, a failed one reached 6.4x.
 MODEL_MAX_RATIO = _tune('MODEL_MAX_RATIO', 3.0)
+# Smallest character the downstream classifier copes with, in pixels; crops
+# below it are enlarged. 0 disables. See the note at the resize step.
+# Parchment grain above which the surface is denoised, measured on the block of
+# writing rather than the whole crop — over the whole crop the reading is of
+# whatever the sheet was lying on, which put the rotate folder above the rough
+# one and had half the benchmark paying for a filter it did not need.
+#
+# 8 rather than 5: at 5 the filter also fires on four perspective images and
+# ruins them, costing that folder 13.1 points against 10.6 gained on roughness.
+# At 8 no perspective image qualifies, the five roughest still do, and the
+# overall figure is the best measured — 86.6% text recovered against 86.1%
+# without any of this, with roughness up 6.5 points and nothing else worse.
+GRAIN_MIN       = _tune('GRAIN_MIN', 8.0)
+MIN_CHAR_PX     = _tune('MIN_CHAR_PX', 24.0)
+MAX_UPSCALE     = _tune('MAX_UPSCALE', 3.0)
 ROUGH_MIN       = _tune('ROUGH_MIN', 0.0)   # flatten only above this roughness;
                                             # 0 = flatten everything, as before
 # Ruled-line suppression (deruling.py). The first ungated version was a large
@@ -144,6 +161,11 @@ ROUGH_MIN       = _tune('ROUGH_MIN', 0.0)   # flatten only above this roughness;
 # whole day was lost earlier to a before/after that turned out to be the same
 # code twice.
 DERULE          = _tune('DERULE', False)
+
+# Filled by crop_image with per-image diagnostics, for the benchmark harness to
+# record. A module-level dict rather than a changed return type, so that every
+# existing caller keeps working.
+LAST_DIAG: dict = {}
 
 # ── Vision API client (singleton) ──────────────────────────────────────────────
 _vision_client = None
@@ -494,6 +516,7 @@ def union_polygon(H: int, W: int, poly1: np.ndarray, poly2: np.ndarray) -> np.nd
 # ── core per-image function ────────────────────────────────────────────────────
 def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
     """Full pipeline for one image. Returns True on success."""
+    LAST_DIAG.clear()
     img = imread_any(img_path)
     if img is None:
         print(f'  SKIP (unreadable): {img_path}')
@@ -694,6 +717,7 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
     if not pre_rotated:
         theta = text_angle(ocr_boxes)
 
+    crop_M = None   # transform from the pre-crop frame into the cropped image
     if theta is not None and abs(theta) >= DESKEW_MIN_DEG:
         # Rotate and crop in one warp: no full-size intermediate, and the corners
         # exposed by the rotation take the sampled parchment colour, not black.
@@ -705,6 +729,7 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
         M[1, 2]   -= y
         cropped    = cv2.warpAffine(result, M, (w, h), flags=cv2.INTER_LINEAR,
                                     borderMode=cv2.BORDER_CONSTANT, borderValue=bg_color)
+        crop_M     = M
     else:
         # Already straight (434 of 436 cached corpus scans are within 0.5°), or no
         # OCR to measure. Slice rather than warp so a flat scan is never resampled.
@@ -713,15 +738,6 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
         # Only with no text direction at all does shape remain the sole signal.
         if theta is None and h / max(w, 1) >= ROTATE_RATIO:
             cropped = cv2.rotate(cropped, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-    # Ruled-line suppression. The scribe scores a groove into the parchment for
-    # every line of text; it is not ink, but it survives binarisation downstream
-    # and bridges adjacent letters, which is why TOUCHING_LETTER_H dominates the
-    # errors reported on ruled scans. Runs before the contrast step so that step
-    # is not asked to flatten a structure that is already gone. Does nothing
-    # unless a periodic ruling is actually detected.
-    if DERULE:
-        cropped, _rule_info = deruling.remove(cropped)
 
     # Background contrast reduction: only on large, roughly square images.
     # Skipped for low-res (strokes too thin) and high-ratio (elongated strips).
@@ -740,13 +756,99 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
             l_new     = np.clip(lf, 0, 255).astype(np.uint8)
             cropped   = cv2.cvtColor(cv2.merge([l_new, a, b]), cv2.COLOR_LAB2BGR)
 
+    # Suppress the grain of the parchment, where there is grain to suppress.
+    #
+    # Not the same failure as small writing, and it needs the opposite remedy.
+    # On the two worst images in the benchmark the characters are a comfortable
+    # 40px, but the surface noise measures 7.8 and 6.1 grey levels against 2.8 on
+    # a clean sheet — the engine reads the speckle as ink. An edge-preserving
+    # smooth averages the speckle away while leaving the boundary of a letter,
+    # which differs from its surroundings by a hundred levels, untouched.
+    #
+    # Gated on the measurement, so a clean sheet is never softened.
+    if GRAIN_MIN > 0:
+        # The boxes are in the frame the crop was taken from; shift them so they
+        # land on the letters in the cropped image rather than a few hundred
+        # pixels away. Needed both to measure the parchment rather than the
+        # table, and to protect the writing during the filter itself.
+        if crop_M is not None:
+            shifted = _apply_to_boxes(ocr_boxes, crop_M)
+        else:
+            shifted = [{**b, 'vertices': [{'x': v['x'] - x, 'y': v['y'] - y}
+                                          for v in b.get('vertices', [])]}
+                       for b in ocr_boxes if b.get('vertices')]
+        grain = texture.measure_grain(cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY),
+                                      boxes=shifted)
+        LAST_DIAG['grain'] = grain["grain"]
+        LAST_DIAG['denoised'] = grain["grain"] >= GRAIN_MIN
+        if grain["grain"] >= GRAIN_MIN:
+            cropped, _tex = texture.suppress(cropped, boxes=shifted)
+
+    # Ruled-line suppression, deliberately after the grain has been taken out.
+    #
+    # A scored line is a faint continuous groove. On a speckled sheet it has to
+    # be found among thousands of similar-amplitude specks, which is what made
+    # the detector unreliable: the autocorrelation that recovers the ruling
+    # period competes with the noise, and the per-column tracking wanders. Once
+    # the surface is clean the line stands alone, the period is unambiguous, and
+    # the track holds.
+    #
+    # So the order matters, and it is the opposite of what it was.
+    if DERULE:
+        cropped, _rule_info = deruling.remove(cropped)
+
+    # Upscale when the writing is too small for the downstream classifier.
+    #
+    # Google Vision reads characters twelve pixels tall without difficulty; the
+    # engine that follows was trained on letter crops and needs more. Measured
+    # across the benchmark, text recovery is flat at 98% for characters of 20px
+    # and above, drops to 86% between 14 and 20, and to 56% below that — 24 of
+    # the 157 images sit under the line.
+    #
+    # Enlarging adds no detail, so this is not about making the letters clearer.
+    # It is about handing the next stage something inside the size range it can
+    # work with at all.
+    if MIN_CHAR_PX > 0 and ocr_boxes:
+        heights = [max(v['y'] for v in b['vertices']) - min(v['y'] for v in b['vertices'])
+                   for b in ocr_boxes if len(b.get('vertices', [])) >= 2]
+        heights = [h for h in heights if h > 0]
+        if heights:
+            char_px = float(np.median(heights))
+            if 0 < char_px < MIN_CHAR_PX:
+                factor = min(MIN_CHAR_PX / char_px, MAX_UPSCALE)
+                ch, cw = cropped.shape[:2]
+                cropped = cv2.resize(cropped, (int(cw * factor), int(ch * factor)),
+                                     interpolation=cv2.INTER_CUBIC)
+
     os.makedirs(out_dir, exist_ok=True)
     stem     = Path(img_path).stem
     # Always write JPEG: cv2.imwrite cannot encode .heic, so echoing the input
     # extension would silently produce nothing for HEIC uploads.
     out_path = os.path.join(out_dir, f'{stem}_cropped.jpg')
     cv2.imwrite(out_path, cropped, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    print(f'  {os.path.basename(img_path):50s} → {w}x{h}  {out_path}')
+    # How much writing did the crop leave behind?
+    #
+    # This is the one failure the cropper is squarely responsible for, and it is
+    # free to measure: Vision already reported every character it found, in the
+    # same coordinate frame as the crop rectangle, so the characters that fall
+    # outside it are exactly the text that was cut away. No second pass, no API
+    # call, no scoring engine.
+    lost = kept = 0
+    for b in ocr_boxes:
+        verts = b.get('vertices') or []
+        if not verts:
+            continue
+        cx = sum(v['x'] for v in verts) / len(verts)
+        cy = sum(v['y'] for v in verts) / len(verts)
+        if x <= cx <= x + w and y <= cy <= y + h:
+            kept += 1
+        else:
+            lost += 1
+    LAST_DIAG.update(chars_found=len(ocr_boxes), chars_kept=kept, chars_lost=lost,
+                     chars_lost_pct=round(100 * lost / max(1, len(ocr_boxes)), 1))
+
+    note = f"   LOST {lost} chars ({LAST_DIAG['chars_lost_pct']}%)" if lost else ""
+    print(f'  {os.path.basename(img_path):50s} → {w}x{h}  {out_path}{note}')
     return True
 
 

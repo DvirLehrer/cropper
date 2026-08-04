@@ -67,6 +67,20 @@ CATEGORIES = [
 
 HEBREW = re.compile(r"[א-ת]")
 
+# A reference of this length means the engine matched the scan to a torah page.
+#
+# Read it as a symptom of our own failure, never as an outside quirk to be
+# excluded from the numbers. The engine picks a reference by comparing what it
+# read against each source, and accepts one only if the length lands within ±20%
+# of it. When the image was poor enough that only part of the text came back,
+# nothing fits, and it falls through to an unconstrained search over hundreds of
+# torah pages — where something always looks vaguely similar.
+#
+# So a torah match on a mezuza means: the picture we handed over could not be
+# read. That is the thing to fix. Filtering these images out of the metric would
+# be hiding exactly the failures the cropper exists to prevent.
+TORAH_REF_LETTERS = 1000
+
 # The company's own read of its report: above roughly this many errors the
 # engine has stopped finding real scribal faults and is simply failing to read
 # the image. A genuine scan usually shows a handful. So the target is not zero
@@ -109,6 +123,13 @@ class CropRecord:
     area_kept_pct: float = 0.0  # crop area as % of input area
     crop_path: str = ""
     crop_sha: str = ""
+    # Characters Vision found that the crop rectangle then excluded — text the
+    # cropper is directly responsible for losing.
+    chars_found: int = 0
+    chars_lost: int = 0
+    chars_lost_pct: float = 0.0
+    grain: float = 0.0          # parchment roughness, measured on the text block
+    denoised: bool = False      # whether the denoiser actually fired
 
 
 def _load_set(path: Path | None) -> set[str] | None:
@@ -211,6 +232,12 @@ def stage_crop(bench: Path, run_dir: Path, model_path: str, only: list[str] | No
             )
             rec.crop_path = str(produced.relative_to(run_dir))
             rec.crop_sha = sha256_file(produced)
+            diag = getattr(crop_stam, "LAST_DIAG", {})
+            rec.chars_found = diag.get("chars_found", 0)
+            rec.chars_lost = diag.get("chars_lost", 0)
+            rec.chars_lost_pct = diag.get("chars_lost_pct", 0.0)
+            rec.grain = round(diag.get("grain", 0.0), 2)
+            rec.denoised = bool(diag.get("denoised", False))
             emit(rec)
 
     if not records:
@@ -576,6 +603,34 @@ def stage_score(run_dir: Path, stam_ocr_dir: Path, model_name: str,
 
     print(f"cache now holds {len(cache)} scored crops → {cache_path}")
 
+    # A short, self-contained block at the very end. The engine prints hundreds
+    # of lines of its own while it works, and the numbers that matter should not
+    # have to be hunted for in the middle of it.
+    try:
+        rows = _join(run_dir, bench)
+        summary = _summarise(rows)
+        overall = summary.get("ALL")
+        if overall:
+            name = run_dir.name
+            settings = {}
+            sfile = run_dir / "settings.json"
+            if sfile.exists():
+                settings = json.loads(sfile.read_text(encoding="utf-8"))
+            interesting = {k: v for k, v in settings.items() if k in (
+                "GRAIN_MIN", "MIN_CHAR_PX", "RESEG_AFTER_DESKEW", "USE_TEXT_REGION",
+                "FLATTEN_BG", "DERULE", "ROUGH_MIN", "MODEL_MAX_RATIO")}
+            print("\n" + "=" * 58)
+            print(f"  RUN {name}   {overall['n']} images")
+            print(f"  text recovered        {overall['text_match_pct']}%")
+            print(f"  under {ERROR_LIMIT} errors        {overall['under_limit_pct']}%")
+            print(f"  unidentifiable        {overall['unreadable_n']}")
+            print(f"  median errors         {overall['median_errors']}")
+            print("  settings              "
+                  + "  ".join(f"{k}={v}" for k, v in sorted(interesting.items())))
+            print("=" * 58)
+    except Exception:                                     # noqa: BLE001
+        pass
+
     # Refresh `current/` so the recovery numbers land next to the pictures.
     import sheet
 
@@ -682,6 +737,11 @@ def _join(run_dir: Path, bench: Path | None = None) -> list[dict]:
             # The headline: did the app come back with a believable number of
             # errors, or did it drown? An image that failed to score never made
             # it under the line.
+            # Flagged, not excluded: see TORAH_REF_LETTERS. These are images the
+            # engine could not read well enough to even identify, which is the
+            # cropper's problem to solve, not a measurement artefact to discount.
+            "unreadable_ref": bool(scored_ok and (s.get("ref_letters") or 0)
+                                   >= TORAH_REF_LETTERS),
             "text_match_pct": s.get("text_match_pct") if scored_ok else 0.0,
             "raw_text_match_pct": (raw.get("text_match_pct")
                                    if bench is not None and raw and raw.get("ok") else None),
@@ -732,6 +792,7 @@ def _summarise(rows: list[dict]) -> dict[str, dict]:
             "text_match_pct": round(sum(r["text_match_pct"] or 0 for r in sel) / len(sel), 1)
                               if matches else None,
             "raw_text_match_pct": round(sum(raw_matches) / len(sel), 1) if raw_matches else None,
+            "unreadable_n": sum(r["unreadable_ref"] for r in sel),
             "under_limit_pct": (round(100 * sum(r["under_limit"] for r in sel) / len(sel), 1)
                                 if scored_any else None),
             "raw_under_limit_pct": (round(100 * sum(r["raw_under_limit"] for r in sel) / len(sel), 1)
@@ -795,7 +856,7 @@ def stage_report(run_dir: Path, vs: Path | None, bench: Path | None = None) -> N
     head = (f"{'category':<16}{'n':>4}"
             f"{'raw text':>10}{'our text':>10}"
             f"{'raw <20':>9}{'ours <20':>10}"
-            f"{'our errs':>10}{'sec':>7}")
+            f"{'unread':>8}{'our errs':>10}{'sec':>7}")
     print("\n" + head)
     print("-" * len(head))
     for category, s in summary.items():
@@ -804,6 +865,7 @@ def stage_report(run_dir: Path, vs: Path | None, bench: Path | None = None) -> N
                 + fmt(s["text_match_pct"], 10)
                 + fmt(s["raw_under_limit_pct"], 9)
                 + fmt(s["under_limit_pct"], 10)
+                + fmt(s["unreadable_n"], 8)
                 + fmt(s["median_errors"], 10)
                 + fmt(s["median_sec"], 7))
         if category in base and base[category].get("text_match_pct") is not None \
@@ -825,6 +887,9 @@ def stage_report(run_dir: Path, vs: Path | None, bench: Path | None = None) -> N
           f"\n  <20   share of images reported with fewer than {ERROR_LIMIT} errors; the"
           "\n        company's own rule of thumb for 'this is a real report, not noise'."
           "\n  errs  median error count."
+          "\n  unread  images the engine could not identify at all: it matched them to"
+          "\n        a torah page because too little text came back for any reference to"
+          "\n        fit. A crop failure, counted as one — not excluded."
           "\n  raw   the untouched photo through the same engine; ours, after our crop.")
     print(f"\nper-image detail: {detail}")
 
