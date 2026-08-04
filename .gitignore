@@ -13,7 +13,17 @@ images/
 test_output/
 current/
 .venv-scoring/
+
+# Training data. Rebuilt by training/build_yolo_polygon.py and uploaded to
+# Drive for Colab; nothing in the repo reads it. It was 540 MB of the 541 MB
+# being cloned.
+yolo_polygon/
+stam polygon.coco/
+stam_polygon_augmented/
+
+# Build outputs, except the patch we hand to the company
 *.zip
+!dist/*.zip
 
 # Secrets / credentials
 hf_token
