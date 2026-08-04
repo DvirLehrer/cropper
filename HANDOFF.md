@@ -486,13 +486,6 @@ is auto-detected. Uniform auto-detection keeps every image on the same footing.
   not in the belief that it will move the numbers. The five worst images in the
   folder are one engine crash, two strips with 17-21 px letters, one genuine
   keystone, and one mezuza with 53 px letters that has no visible defect at all.
-
-- **Small letters on narrow strips** is the strongest signal found. Ink height
-  measured on all 157 crops: under 20 px, 24 images recover 74.2% of the text
-  and 8% come in under 20 errors; over 60 px, 23 images recover 95.0% and 70%
-  come in under 20. Twenty-one of those 24 are long thin strips. `MIN_CHAR_PX`
-  fires on them, but it measures the Vision box rather than the ink, so they
-  still come out at 15-17 px. Untested: raising it to 32.
 - **Ruled-line suppression is written and switched off.** `deruling.py` finds a
   periodic line by autocorrelation and subtracts it. It is worth 0.1 points and
   is not enabled. Re-tested after the denoiser went in, on the theory that a
