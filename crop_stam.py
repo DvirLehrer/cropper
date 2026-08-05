@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -765,6 +766,15 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
     # measurement and nothing more.
     if rectify.ENABLED and not spun:
         moved = rectify.apply_to_boxes(ocr_boxes, box_H)
+        # RECT_DUMP=some/dir writes the character boxes exactly as the rectifier
+        # sees them, so the fit can be reworked offline instead of re-running the
+        # Vision API for every attempt.
+        if os.environ.get('RECT_DUMP'):
+            d = Path(os.environ['RECT_DUMP'])
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f'{Path(img_path).stem}.json').write_text(json.dumps(
+                {'image': str(img_path), 'shape': list(cropped.shape[:2]),
+                 'boxes': moved}, ensure_ascii=False), encoding='utf-8')
         cropped, rect_H, rect_info = rectify.rectify(cropped, moved, fill=bg_color)
         LAST_DIAG['fan'] = rect_info.get('fan')
         LAST_DIAG['rectified'] = rect_info.get('rectified')
