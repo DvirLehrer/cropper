@@ -62,11 +62,12 @@ def _flag(name: str, default: str) -> bool:
 ENABLED = _flag("RECTIFY", "1")
 
 # Degrees of convergence between the first text line and the last, below which
-# the page is left alone. Correcting a flat page can only resample it for
-# nothing, and `mezuzah1` is the warning: measured at 2.82° by the broken
-# grouping it was rectified and went from 49 errors to 60, when its true figure
-# is 0.97° and it needed no correction at all.
-MIN_FAN = float(os.environ.get("RECTIFY_MIN_FAN", "2.5"))
+# the page is left alone: correcting a flat page can only resample it for
+# nothing. Across 429 corpus scans the measure reads 0.19 at the median and 1.33
+# at the 95th percentile, so this fires on the tail and not on the body. Set at
+# 2.0 rather than 2.5 because one page measuring 2.17 went from 234 errors to 37
+# when it was corrected.
+MIN_FAN = float(os.environ.get("RECTIFY_MIN_FAN", "2.0"))
 
 # Fewer lines than this and the vanishing point is a guess.
 MIN_LINES = int(os.environ.get("RECTIFY_MIN_LINES", "4"))
@@ -75,6 +76,25 @@ MIN_CHARS_PER_LINE = int(os.environ.get("RECTIFY_MIN_CHARS", "6"))
 # A correction that moves a corner by more than this fraction of the image is
 # not a keystone, it is a failed fit.
 MAX_SHIFT = float(os.environ.get("RECTIFY_MAX_SHIFT", "0.35"))
+
+# Widest the block of writing may be, relative to its height, before the fit is
+# refused as under-determined.
+#
+# The horizon is fixed by how the line spacing changes down the page, and on a
+# tefillin strip there is barely any page to change down: seven lines across
+# 284 px of height against 1526 px of width. The fit that comes out of that is
+# a guess, and it stretches the image along one axis until the writing smears.
+# One strip scored 96% under one such guess and 23% under another that measured
+# almost the same. Strips are also the least likely to be flat — they curl —
+# and a homography has one plane to offer.
+MAX_ASPECT = float(os.environ.get("RECTIFY_MAX_ASPECT", "3.0"))
+
+# How much more the correction may stretch one direction than the other. A
+# keystone correction is close to a rotation with a mild squeeze; anything that
+# pulls one axis several times harder than the other is smearing the writing,
+# and it does so while leaving the *character boxes* perfectly straight, so the
+# self-check below cannot see it.
+MAX_ANISOTROPY = float(os.environ.get("RECTIFY_MAX_ANISOTROPY", "1.6"))
 
 
 def _centres(boxes: list) -> list[tuple[float, float]]:
@@ -352,6 +372,10 @@ def homography(groups: list, shape: tuple) -> np.ndarray | None:
         return None                       # left-handed: would mirror the text
     A = A / np.sqrt(det)                  # unit determinant keeps letters the same size
 
+    s = np.linalg.svd(A, compute_uv=False)
+    if s[0] / max(s[1], 1e-9) > MAX_ANISOTROPY:
+        return None                       # stretching one axis, not straightening
+
     Ha = np.eye(3)
     Ha[:2, :2] = A
     return np.linalg.inv(T) @ Ha @ Hp @ T
@@ -382,6 +406,13 @@ def rectify(img: np.ndarray, boxes: list, fill=None):
     info["lines"] = len(groups)
     if len(groups) < MIN_LINES:
         info["reason"] = "too few text lines"
+        return img, None, info
+
+    xs = [p[0] for g in groups for p in g]
+    ys = [p[1] for g in groups for p in g]
+    block_w, block_h = max(xs) - min(xs), max(ys) - min(ys)
+    if block_h <= 0 or block_w / block_h > MAX_ASPECT:
+        info["reason"] = f"text block {block_w / max(block_h, 1):.1f}:1, too flat to fit"
         return img, None, info
 
     info["fan"] = round(fan_degrees(groups), 2)
