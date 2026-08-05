@@ -87,6 +87,64 @@ Downscaling before filtering was tried as a cheaper route and abandoned: halving
 the image first is four times faster, but the resample alone moves letter edges
 by 5.6 grey levels against 1.5, which is the entire thing being avoided.
 
+## Perspective: the last contract criterion, and what it cost to get right
+
+Criterion 2 had nothing behind it. It does now, and the way it went is worth
+reading before touching `rectify.py`, because almost every wrong turn looked
+right at the time.
+
+The correction reads two vanishing points off the character boxes Vision has
+already returned. Text lines that are parallel on the parchment converge in the
+photograph and give the first. The second was originally taken from where the
+left and right margins converge, which is wrong on this material: STaM justifies
+the right margin and lets the left fall where the words end, so the right sits
+within 12-32 px of straight and the left within 66-132. What pins it instead is
+the ruling — lines scored into the skin before a word is written, therefore
+evenly spaced, and the rate at which they crowd together fixes the horizon.
+
+Five failures, each of which the numbers alone would have passed:
+
+* **The mirror.** A vanishing point is a direction without a sign, so the basis
+  can come out left-handed and the page is rectified into its own reflection.
+  Every letter reversed, perfectly straight. Obvious to a person, invisible to
+  the metric — mirrored text scores zero and joins every other kind of failure.
+* **Merged lines.** Sorting characters by height merges neighbouring lines on
+  exactly the pages that need correcting; `mezuzah1` came out as nine groups for
+  twenty lines, two holding 268 and 248 characters. Chaining to nearby
+  characters is transitive and welds lines together where one ends at the height
+  the next begins. A line is now followed along its own direction.
+* **The blank margin.** The geometry was right and the image looked right, and
+  the error count went from 467 to 547. Warping a rectangle gives a
+  quadrilateral, and taking its bounding box left the text filling 58% of the
+  frame instead of 94%. The engine said so at the time, eleven times on that one
+  image: `init_new_word was called when last word in line is empty`.
+* **Invented lines.** Crowns on the letters throw off short chains that sit on
+  top of real lines, and the horizon is found by evening out the line spacing —
+  so half of what it was evening out was noise. One straight page went in at
+  1.07° and came out at 2.18°.
+* **The strips.** Seven lines across 284 px of height against 1526 px of width
+  is under-determined, and the fit stretches the image along one axis until the
+  writing smears. The self-check passed it: the character boxes came out
+  measuring 0.39°, straight as anything, because they had been carried through
+  the same transform that ruined the picture.
+
+The lesson that generalises: **straight boxes and readable writing are not the
+same claim.** Every guard in `rectify.py` exists because one of these got
+through. Look at the pictures before believing a number.
+
+Measured over the benchmark, the correction fires on about one image in
+fifteen and gains 77 points of text across them:
+
+    IMG_1213    461 errors →  26      64% → 98%
+    IMG_1210    330 →  19             80% → 99%
+    WhatsApp    234 →  38             85% → 98%
+    WhatsApp    201 → 107             85% → 93%
+    IMG_1209     87 →  43             94% → 97%
+
+against three small losses of 7→19, 12→23 and 4→12 errors. Overall that is
+worth half a point to a point, because twelve images out of 157 cannot move an
+average far. The images it moves are the ones that were failing outright.
+
 ## Where this stands — measured, not estimated
 
 Everything below was measured with `tools/bench.py` against the company's own
@@ -298,7 +356,7 @@ of code could fix, and makes this repo the candidate to finish.
 | 3 | `NO_DETECTION` on 10 images | was three crashes in their engine, not ours. Patched; 156/157 now return |
 | 4 | Basic crop clips letters | measured: the crop loses more than 2% of characters on 1 image of 157. Margin and text-region outline both made it worse and stay off |
 | ~~5~~ | ~~Google Vision dependency~~ | accepted by the company |
-| 6 | Perspective | still not implemented — see below |
+| 6 | Perspective — criterion 2, never implemented | done: `rectify.py`. IMG_1213 461 errors → 26 |
 
 Note that (4) was ours, not theirs: their report never separated it out, because
 their success metric could not see it. It turned out not to be a real problem.
@@ -325,12 +383,11 @@ photographed at roughly 25°; `IMG_1219` is a tefillin strip at an arbitrary
 angle *and* needing 90°. The real task is **arbitrary-angle correction**, with
 the 90° case as one instance of it.
 
-This also means rotation and perspective are one problem, not two, and should be
-solved together: the YOLO polygon is already computed, so `cv2.minAreaRect` on it
-yields the angle for free, and fitting it to a quadrilateral (`approxPolyDP`)
-plus one `warpPerspective` handles keystone in the same pass. Criterion 2 was
-dropped from the second delivery because it was expensive; done this way it is
-tens of milliseconds on data we already have.
+Rotation and perspective are one problem, not two, and both are now solved from
+the same data — but not from the polygon, as this section originally proposed.
+Fitting the YOLO outline to a quadrilateral fails on this material, because the
+outline is least trustworthy exactly when the photograph is worst. Both angles
+come from the character boxes instead. See the perspective section above.
 
 ### Already done, not yet measured
 
@@ -347,7 +404,6 @@ would come out ~180°, and every straight page would be flipped upside down. It
 does not. The code comment claiming "434 of 436" is slightly off; the figure is
 420.
 
-Perspective correction still does not exist.
 
 ## Prime suspect: the rotation heuristic (resolved — kept for context)
 
@@ -476,16 +532,6 @@ is auto-detected. Uniform auto-detection keeps every image on the same footing.
   cannot be attributed to the code rather than to the test set.
 - **Objects has only 9 images**, so each one is worth 11% — too small to support
   any threshold. Worth asking for more magnet/tape samples.
-- **Perspective correction does not exist**, and it was measured rather than
-  assumed. `tools/measure_perspective.py` finds text lines in the finished crop
-  and reports how much they fan. Over 114 crops the correlation between fan and
-  text recovered is +0.06. Two images exceed 5°: `IMG_1209` at 9.98° recovers
-  94%, `IMG_1213` at 8.46° recovers 64%. Same distortion, opposite outcome.
-
-  Criterion 2 still asks for it, so it should be built for the contract — but
-  not in the belief that it will move the numbers. The five worst images in the
-  folder are one engine crash, two strips with 17-21 px letters, one genuine
-  keystone, and one mezuza with 53 px letters that has no visible defect at all.
 - **Ruled-line suppression is written and switched off.** `deruling.py` finds a
   periodic line by autocorrelation and subtracts it. It is worth 0.1 points and
   is not enabled. Re-tested after the denoiser went in, on the theory that a
@@ -530,11 +576,17 @@ the sheet after each run.
 
 Run `final3`, 157 images, share of the known reference text recovered:
 
-    01_cropper      87.9      04_objects      97.4
-    02_rotate       87.3      05_drawings     81.0
+    01_cropper      87.9      04_objects      97.1
+    02_rotate       87.6      05_drawings     81.0
     03_perspective  86.8      06_roughness    81.7
-                              00_general      96.1
-    ALL             86.6      under 20 errors 33.1      0.99 s
+                              00_general      96.2
+    ALL             87.1      under 20 errors 33.8      1.0 s
+
+Two images in the final run returned nothing for reasons outside the cropper —
+a Vision 503 mid-run, and one of the three engine crashes the patch fixes — and
+they are worth 1.2 points between them. Re-run before quoting any figure to a
+decimal place; run-to-run noise here is about half a point, because YOLO is not
+deterministic and a handful of images sit on a knife edge in the engine.
 
 ## Next steps, in order
 
@@ -542,9 +594,7 @@ Run `final3`, 157 images, share of the known reference text recovered:
    14-line diff, and the measurements. Without it the engine returns nothing on
    14 of 157 images no matter what the cropper does. Verified as safe: 143
    verdicts unchanged, 14 rescued, 0 altered.
-2. **Perspective**, as described under open items. The last contract criterion
-   with nothing behind it.
-3. **Drawings**, at 81.0% the weakest category. `deruling.py` is written and
+2. **Drawings**, at 81.0% the weakest category. `deruling.py` is written and
    switched off; that is where to start, but it needs a better detector rather
    than a better threshold.
 4. Leave objects and general backgrounds alone except to confirm they have not

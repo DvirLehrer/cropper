@@ -11,12 +11,12 @@ photographs, scored against the production engine:
 | | untouched photo | after this cropper |
 |---|---|---|
 | the engine returns a result at all | 52.9% | 99.4% |
-| of the known reference text, how much it read | 40.5% | 86.6% |
+| of the known reference text, how much it read | 40.5% | 87.1% |
 | 90% or more of the text recovered | — | 69.4% |
 
 Six times as many images come back with fewer than twenty reported errors.
 
-Median 0.99 s an image.
+Median 1.0 s an image.
 
 The first row assumes the three crashes patched in `dist/stam-ocr-crash-fixes.zip`
 are applied. Without them the engine throws on 14 of the 157 no matter what the
@@ -114,6 +114,14 @@ particular upload comes out wrong.
    parchment is out of distribution for it, and the second polygon on the
    corrected image is materially better. Only above 2°.
 
+4b. **Rectify**, if the page was photographed at an angle. Deskew rotates the
+   writing upright, which is all a rotation can do; it cannot make converging
+   text lines parallel. The two vanishing points are read off the character
+   boxes — the lines give one, the evenly ruled spacing pins the other — and
+   mapped back to infinity. Fires on about one image in fifteen. See
+   `rectify.py`: the guards there are each the result of a specific failure,
+   including one that rectified a page into its own mirror image.
+
 5. **Boundary.** Character boxes are grouped into connected text clusters, every
    cluster touching the model polygon is taken whole — so catching one end of a
    line pulls in the rest of it — and the convex hull of those is OR'd with the
@@ -177,6 +185,7 @@ filterable, rebuilt as the run proceeds.
 crop_stam.py          production pipeline and CLI
 crop_with_model.py    YOLO inference
 stam_io.py            decoding, including HEIC
+rectify.py            keystone correction from the text lines
 texture.py            grain measurement and suppression
 deruling.py           ruled-line suppression (written, switched off)
 best.pt               model weights
