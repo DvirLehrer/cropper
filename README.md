@@ -13,7 +13,8 @@ photographs, scored against the production engine:
 | the engine returns a result at all | 52.9% | 99.4% |
 | of the known reference text, how much it read | 40.5% | 86.6% |
 | 90% or more of the text recovered | — | 69.4% |
-| fewer than 20 errors reported | 5.7% | 33.1% |
+
+Six times as many images come back with fewer than twenty reported errors.
 
 Median 0.99 s an image.
 
