@@ -82,21 +82,62 @@ def _centres(boxes: list) -> list[tuple[float, float]]:
 
 
 def group_lines(boxes: list) -> list[list[tuple[float, float, float]]]:
-    """Sort character centres into text lines by vertical position."""
+    """Chain characters into text lines by following each line along itself.
+
+    Sorting by height alone is the obvious way and it fails on exactly the
+    images this module exists for. A line on a keystoned page descends further
+    across the width of the sheet than one line is tall, so neighbouring lines
+    overlap in y and merge: on `mezuzah1` that produced nine groups for twenty
+    lines, two of them holding 268 and 248 characters. The vanishing point fitted
+    to those is meaningless, and the correction silently declined to run.
+
+    So each character is instead linked to the ones beside it — within a couple
+    of character widths horizontally, within half a character height vertically —
+    and a line is a connected chain of those links. The rule is local, so it
+    follows a line wherever it goes rather than assuming it stays level.
+    """
     pts = _centres(boxes)
     if len(pts) < MIN_LINES * MIN_CHARS_PER_LINE:
         return []
     med_h = float(np.median([p[2] for p in pts])) or 1.0
-    pts.sort(key=lambda p: p[1])
-    groups, cur = [], [pts[0]]
-    for p in pts[1:]:
-        if p[1] - cur[-1][1] <= 0.6 * med_h:
-            cur.append(p)
-        else:
-            groups.append(cur)
-            cur = [p]
-    groups.append(cur)
-    return [g for g in groups if len(g) >= MIN_CHARS_PER_LINE]
+    pts.sort(key=lambda p: p[0])                     # by x: neighbours are near in the list
+    xy = np.array([[p[0], p[1]] for p in pts])
+    n = len(pts)
+
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        a, b = find(i), find(j)
+        if a != b:
+            parent[b] = a
+
+    # A character is followed by its neighbours in reading order, so only a
+    # short window ahead in the x-sorted list needs checking.
+    reach_x = 2.5 * med_h
+    reach_y = 0.5 * med_h
+    window = 40
+    for i in range(n):
+        xi, yi = xy[i]
+        for j in range(i + 1, min(n, i + window)):
+            dx = xy[j, 0] - xi
+            if dx > reach_x:
+                break
+            if abs(xy[j, 1] - yi) <= reach_y:
+                union(i, j)
+
+    chains: dict = {}
+    for i, p in enumerate(pts):
+        chains.setdefault(find(i), []).append(p)
+    groups = [sorted(g, key=lambda p: p[0]) for g in chains.values()
+              if len(g) >= MIN_CHARS_PER_LINE]
+    groups.sort(key=lambda g: float(np.mean([p[1] for p in g])))
+    return groups
 
 
 def _fit(pts: np.ndarray) -> np.ndarray:

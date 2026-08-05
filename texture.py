@@ -90,8 +90,10 @@ def ink_mask_from_boxes(gray: np.ndarray, boxes: list) -> np.ndarray | None:
             continue
         xs = [v['x'] for v in verts]
         ys = [v['y'] for v in verts]
-        x0, x1 = max(0, min(xs)), min(w, max(xs) + 1)
-        y0, y1 = max(0, min(ys)), min(h, max(ys) + 1)
+        # int(): the vertices are floats once they have been through a warp,
+        # and these index the array directly.
+        x0, x1 = max(0, int(min(xs))), min(w, int(round(max(xs))) + 1)
+        y0, y1 = max(0, int(min(ys))), min(h, int(round(max(ys))) + 1)
         if x1 - x0 < 3 or y1 - y0 < 3:
             continue
         patch = gray[y0:y1, x0:x1]
@@ -130,8 +132,11 @@ def text_area(shape: tuple, boxes: list, pad_frac: float = 0.5):
         return None
     pad = int(round(pad_frac * (np.median(hs) if hs else 0)))
     h, w = shape[:2]
-    return (max(0, min(xs) - pad), max(0, min(ys) - pad),
-            min(w, max(xs) + pad), min(h, max(ys) + pad))
+    # Rounded, because these index an array. The boxes arrive as floats once
+    # they have been carried through a warp, and a float slice is a TypeError
+    # that kills the whole crop — mezuzah1 came out 0x0 this way.
+    return (max(0, int(min(xs)) - pad), max(0, int(min(ys)) - pad),
+            min(w, int(round(max(xs))) + pad), min(h, int(round(max(ys))) + pad))
 
 
 def measure_grain(gray: np.ndarray, ink: np.ndarray | None = None,

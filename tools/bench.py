@@ -130,6 +130,8 @@ class CropRecord:
     chars_lost_pct: float = 0.0
     grain: float = 0.0          # parchment roughness, measured on the text block
     denoised: bool = False      # whether the denoiser actually fired
+    fan: float = 0.0            # degrees of keystone measured across the text
+    rectified: bool = False     # whether the keystone correction actually fired
 
 
 def _load_set(path: Path | None) -> set[str] | None:
@@ -238,6 +240,8 @@ def stage_crop(bench: Path, run_dir: Path, model_path: str, only: list[str] | No
             rec.chars_lost_pct = diag.get("chars_lost_pct", 0.0)
             rec.grain = round(diag.get("grain", 0.0), 2)
             rec.denoised = bool(diag.get("denoised", False))
+            rec.fan = round(diag.get("fan") or 0.0, 2)
+            rec.rectified = bool(diag.get("rectified", False))
             emit(rec)
 
     if not records:
