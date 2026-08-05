@@ -362,8 +362,23 @@ def rectify(img: np.ndarray, boxes: list, fill=None):
         info["reason"] = f"corner moved {shift:.0%}, refusing"
         return img, None, info
 
-    x0, y0 = moved.min(0)
-    x1, y1 = moved.max(0)
+    # Frame the result on the writing, not on the warped rectangle.
+    #
+    # A projective warp turns the crop rectangle into a quadrilateral, and
+    # taking its bounding box leaves wide wedges of blank parchment in the
+    # corners: on IMG_1213 the text fell from 94% of the image to 58%, with a
+    # 356 px margin down one side. The engine noticed before we did — it logged
+    # `init_new_word was called when last word in line is empty` eleven times on
+    # that image, looking for words in the empty ground, and its error count rose
+    # from 467 to 547 on a page that had just been straightened.
+    ink = cv2.perspectiveTransform(
+        np.array([[[p[0], p[1]]] for g in groups for p in g], np.float32),
+        H).reshape(-1, 2)
+    pad = 0.5 * float(np.median([p[2] for g in groups for p in g]))
+    x0 = max(float(moved[:, 0].min()), float(ink[:, 0].min()) - pad)
+    y0 = max(float(moved[:, 1].min()), float(ink[:, 1].min()) - pad)
+    x1 = min(float(moved[:, 0].max()), float(ink[:, 0].max()) + pad)
+    y1 = min(float(moved[:, 1].max()), float(ink[:, 1].max()) + pad)
     ow, oh = int(round(x1 - x0)), int(round(y1 - y0))
     if not (0 < ow < 4 * w and 0 < oh < 4 * h):
         info["reason"] = f"implausible output {ow}x{oh}"
