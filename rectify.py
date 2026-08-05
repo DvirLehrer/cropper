@@ -163,6 +163,21 @@ def group_lines(boxes: list) -> list[list[tuple[float, float, float]]]:
             groups.append([pts[i] for i in sorted(line, key=lambda i: xy[i, 0])])
 
     groups.sort(key=lambda g: float(np.mean([p[1] for p in g])))
+
+    # Drop the fragments.
+    #
+    # Crowns on the letters and the ruled lines themselves throw off short
+    # chains that sit almost on top of a real line: on one engraved mezuza this
+    # returned 29 lines for a page of 22, and the spurious ones showed up as
+    # gaps of 0, 1, 5 and 7 px where a line is 120 px from its neighbour. That
+    # matters more than it looks, because the horizon below is found by making
+    # the line spacing as even as possible, and half of what it was evening out
+    # was noise. It rectified a page that measured 1.07 degrees into one that
+    # measured 2.18.
+    if len(groups) >= MIN_LINES:
+        sizes = [len(g) for g in groups]
+        floor = 0.4 * float(np.median(sizes))
+        groups = [g for g in groups if len(g) >= floor]
     return groups
 
 
@@ -186,7 +201,16 @@ def _intersect(lines: list[np.ndarray]) -> np.ndarray:
 
 
 def fan_degrees(groups: list) -> float:
-    """Angle between the first text line and the last, slope removed."""
+    """Angle between the topmost text line and the bottom one.
+
+    Estimated by the median of the pairwise rates rather than by a least-squares
+    fit. One short line whose angle is off — and a page of script always has a
+    few, the last line of a paragraph among them — swings a least-squares slope
+    hard when it sits at the top or the bottom of the block, which is exactly
+    where it has the most leverage. `mezuzah1` measured 0.97 degrees with one
+    grouping and 2.92 with another that differed by a single line, and the
+    second was enough to send a flat page through the correction.
+    """
     if len(groups) < MIN_LINES:
         return 0.0
     angs, ys = [], []
@@ -199,7 +223,15 @@ def fan_degrees(groups: list) -> float:
     if len(angs) < MIN_LINES:
         return 0.0
     a, y = np.array(angs), np.array(ys)
-    return abs(float(np.polyfit(y, a, 1)[0] * (y.max() - y.min())))
+    rates = []
+    for i in range(len(a)):
+        for j in range(i + 1, len(a)):
+            dy = y[j] - y[i]
+            if abs(dy) > 1e-6:
+                rates.append((a[j] - a[i]) / dy)
+    if not rates:
+        return 0.0
+    return abs(float(np.median(rates)) * (y.max() - y.min()))
 
 
 def _horizon(baselines: list, v_text: np.ndarray) -> np.ndarray | None:
@@ -232,6 +264,11 @@ def _horizon(baselines: list, v_text: np.ndarray) -> np.ndarray | None:
         return None
     heights = np.sort(np.array(heights))
 
+    # A mezuza breaks into paragraphs, and the gap at a break is not the gap
+    # between two lines of the same paragraph. Judging evenness on the median
+    # rather than the mean keeps those breaks from dragging the fit: a handful
+    # of wide gaps move a median hardly at all and a standard deviation a great
+    # deal.
     def unevenness(b: float) -> float:
         denom = b * heights + 1.0
         if np.any(np.abs(denom) < 1e-6):
@@ -240,7 +277,10 @@ def _horizon(baselines: list, v_text: np.ndarray) -> np.ndarray | None:
         d = np.diff(np.sort(y))
         if len(d) < 2 or np.any(d <= 0):
             return np.inf
-        return float(np.std(d) / np.mean(d))
+        med = float(np.median(d))
+        if med <= 0:
+            return np.inf
+        return float(np.median(np.abs(d - med)) / med)
 
     span = max(abs(heights).max(), 1.0)
     grid = np.linspace(-4.0 / span, 4.0 / span, 801)
@@ -352,6 +392,17 @@ def rectify(img: np.ndarray, boxes: list, fill=None):
     H = homography(groups, img.shape)
     if H is None:
         info["reason"] = "fit rejected"
+        return img, None, info
+
+    # Check the answer against the question. Carrying the character boxes
+    # through the transform and measuring them again costs a millisecond and
+    # says plainly whether the page came out straighter than it went in. A fit
+    # that does not flatten the page is a fit that has gone wrong, whatever its
+    # corners happen to do.
+    after = fan_degrees(group_lines(apply_to_boxes(boxes, H)))
+    info["fan_after"] = round(after, 2)
+    if after > max(0.4 * info["fan"], 0.5):
+        info["reason"] = f"still {after:.1f}° after correction, refusing"
         return img, None, info
 
     h, w = img.shape[:2]
