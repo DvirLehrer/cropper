@@ -30,6 +30,7 @@ from google.cloud import vision
 from ultralytics import YOLO
 
 import deruling
+import rectify
 import texture
 from crop_with_model import _predict, _tiled_predict, _imgsz_for, SPLIT_RATIO
 from stam_io import imread_any, list_images
@@ -62,7 +63,7 @@ def active_settings() -> dict:
         "MODEL_LEASH_CHARS", "FLATTEN_BG", "ROUGH_MIN", "CLIP_TO_SHEET", "USE_TEXT_REGION",
         "RESEG_AFTER_DESKEW", "RESEG_MIN_DEG", "MODEL_MAX_RATIO",
         "MIN_CHAR_PX", "MAX_UPSCALE", "GRAIN_MIN", "DERULE",
-    )}
+    )} | {"RECTIFY": rectify.ENABLED, "RECTIFY_MIN_FAN": rectify.MIN_FAN}
 
 
 # ── constants ──────────────────────────────────────────────────────────────────
@@ -718,6 +719,7 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
         theta = text_angle(ocr_boxes)
 
     crop_M = None   # transform from the pre-crop frame into the cropped image
+    spun   = False  # the 90° fallback fired, so the boxes no longer line up
     if theta is not None and abs(theta) >= DESKEW_MIN_DEG:
         # Rotate and crop in one warp: no full-size intermediate, and the corners
         # exposed by the rotation take the sampled parchment colour, not black.
@@ -738,6 +740,36 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
         # Only with no text direction at all does shape remain the sole signal.
         if theta is None and h / max(w, 1) >= ROTATE_RATIO:
             cropped = cv2.rotate(cropped, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            spun = True
+
+    # One transform from the original frame into the cropped image, so the
+    # character boxes can be carried along whichever branch was taken above and
+    # whatever happens below. Everything downstream that needs to know where the
+    # letters are reads this rather than reconstructing it.
+    box_H = np.eye(3)
+    if crop_M is not None:
+        box_H[:2, :] = crop_M
+    else:
+        box_H[0, 2], box_H[1, 2] = -x, -y
+
+    # Undo the keystone of a page photographed at an angle.
+    #
+    # Deskew above rotates the writing upright, which is everything a rotation
+    # can do; it cannot make converging text lines parallel. This reads the two
+    # vanishing points off the character boxes and maps them back to infinity.
+    # See rectify.py for why the writing is a better guide than the edge of the
+    # parchment, and for the mirror-image failure this took some care to avoid.
+    #
+    # Gated hard. Across the benchmark 93% of pages measure under 2° of
+    # convergence and are already flat, so for almost every image this is a
+    # measurement and nothing more.
+    if rectify.ENABLED and not spun:
+        moved = rectify.apply_to_boxes(ocr_boxes, box_H)
+        cropped, rect_H, rect_info = rectify.rectify(cropped, moved, fill=bg_color)
+        LAST_DIAG['fan'] = rect_info.get('fan')
+        LAST_DIAG['rectified'] = rect_info.get('rectified')
+        if rect_H is not None:
+            box_H = rect_H @ box_H
 
     # Background contrast reduction: only on large, roughly square images.
     # Skipped for low-res (strokes too thin) and high-ratio (elongated strips).
@@ -767,16 +799,12 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
     #
     # Gated on the measurement, so a clean sheet is never softened.
     if GRAIN_MIN > 0:
-        # The boxes are in the frame the crop was taken from; shift them so they
-        # land on the letters in the cropped image rather than a few hundred
-        # pixels away. Needed both to measure the parchment rather than the
-        # table, and to protect the writing during the filter itself.
-        if crop_M is not None:
-            shifted = _apply_to_boxes(ocr_boxes, crop_M)
-        else:
-            shifted = [{**b, 'vertices': [{'x': v['x'] - x, 'y': v['y'] - y}
-                                          for v in b.get('vertices', [])]}
-                       for b in ocr_boxes if b.get('vertices')]
+        # The boxes are in the frame of the original photograph; carry them
+        # through everything done since, so they land on the letters in the
+        # cropped image rather than a few hundred pixels away. Needed both to
+        # measure the parchment rather than the table, and to protect the
+        # writing during the filter itself.
+        shifted = ([] if spun else rectify.apply_to_boxes(ocr_boxes, box_H))
         grain = texture.measure_grain(cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY),
                                       boxes=shifted)
         LAST_DIAG['grain'] = grain["grain"]
