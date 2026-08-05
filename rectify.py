@@ -15,17 +15,25 @@ outline is unreliable exactly when the photograph is bad, which is when the
 correction is needed.
 
 The writing is the more dependable signal, and it is already measured. Google
-Vision has returned a quad for every character, and in a keystoned photograph:
+Vision has returned a quad for every character, and in a keystoned photograph
+the text lines, parallel on the parchment, converge to a vanishing point.
 
-* the text lines, parallel on the parchment, converge to a vanishing point;
-* the margins do too, and STaM is justified to a degree ordinary handwriting is
-  not, so the first and last character of each line give a second one.
+That point alone leaves one degree of freedom. Pinning it from the left-hand
+margin was the first attempt and it failed: STaM justifies the right margin and
+lets the left fall where the words end, so on these pages the right sits within
+12-32 px of a straight line and the left within 66-132. The fit that came out of
+those two moved a corner by 49-65% of the image and was refused, correctly, by
+the guard below.
 
-Two vanishing points fix the distortion completely. The homography that sends
-them both to infinity makes parallel lines parallel again; a second, affine step
-makes the two directions perpendicular. Both are a few matrix operations on
-thirty points — the cost is one `warpPerspective`, 9 ms on a 3 MP image, against
-the 575 ms the Vision call already costs.
+What pins it instead is the ruling. The lines are scored into the skin with a
+stylus before a word is written, so on the parchment they are parallel *and
+evenly spaced*; in the photograph they crowd together as they recede, and the
+rate at which they crowd fixes the horizon exactly. Twenty ruled lines rather
+than two ragged margins. The column direction is then taken from the justified
+margin alone, measured after the projective part is undone.
+
+The cost is one `warpPerspective`, 9 ms on a 3 MP image, against the 575 ms the
+Vision call already costs.
 
 The mirror
 ----------
@@ -54,9 +62,10 @@ def _flag(name: str, default: str) -> bool:
 ENABLED = _flag("RECTIFY", "1")
 
 # Degrees of convergence between the first text line and the last, below which
-# the page is left alone. Set from the benchmark: 93% of images measure under
-# 2°, and those are pages that are already flat — correcting them can only
-# resample them for nothing. The two images that need this measure 8.5° and 10°.
+# the page is left alone. Correcting a flat page can only resample it for
+# nothing, and `mezuzah1` is the warning: measured at 2.82° by the broken
+# grouping it was rectified and went from 49 errors to 60, when its true figure
+# is 0.97° and it needed no correction at all.
 MIN_FAN = float(os.environ.get("RECTIFY_MIN_FAN", "2.5"))
 
 # Fewer lines than this and the vanishing point is a guess.
@@ -84,58 +93,75 @@ def _centres(boxes: list) -> list[tuple[float, float]]:
 def group_lines(boxes: list) -> list[list[tuple[float, float, float]]]:
     """Chain characters into text lines by following each line along itself.
 
-    Sorting by height alone is the obvious way and it fails on exactly the
-    images this module exists for. A line on a keystoned page descends further
-    across the width of the sheet than one line is tall, so neighbouring lines
-    overlap in y and merge: on `mezuzah1` that produced nine groups for twenty
-    lines, two of them holding 268 and 248 characters. The vanishing point fitted
-    to those is meaningless, and the correction silently declined to run.
+    Two simpler rules were tried first and both failed on exactly the images
+    this module exists for.
 
-    So each character is instead linked to the ones beside it — within a couple
-    of character widths horizontally, within half a character height vertically —
-    and a line is a connected chain of those links. The rule is local, so it
-    follows a line wherever it goes rather than assuming it stays level.
+    Sorting by height alone: a line on a keystoned page descends further across
+    the sheet than one line is tall, so neighbouring lines overlap in y and
+    merge. On `mezuzah1` that gave nine groups for twenty lines, two of them
+    holding 268 and 248 characters.
+
+    Linking each character to whatever is near it: the links are transitive, and
+    where the end of one line sits at the height of the start of the next a
+    chain walks across the gap and welds them together. Cleaner than sorting, and
+    still wrong — `IMG_1209` came out as 17 lines with 68, 67, 70 and 103
+    characters where a line holds 34.
+
+    A line is therefore followed along *itself*: from each character, look only
+    ahead in the direction the line has been travelling, and re-estimate that
+    direction from the last few characters read. The next line is never ahead in
+    the direction the current one is going, so the jump cannot happen. It also
+    tracks a line that bends, which the ruling on a curled sheet does.
     """
     pts = _centres(boxes)
     if len(pts) < MIN_LINES * MIN_CHARS_PER_LINE:
         return []
     med_h = float(np.median([p[2] for p in pts])) or 1.0
-    pts.sort(key=lambda p: p[0])                     # by x: neighbours are near in the list
-    xy = np.array([[p[0], p[1]] for p in pts])
+    xy = np.array([[p[0], p[1]] for p in pts], float)
     n = len(pts)
+    order = np.argsort(xy[:, 0])                     # right to left is fine either way
+    taken = np.zeros(n, bool)
 
-    parent = list(range(n))
+    reach_x = 2.0 * med_h        # how far ahead to look for the next character
+    corridor = 0.45 * med_h      # how far off the predicted height it may sit
+    groups = []
 
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
+    # Follow each line along itself, predicting where it goes next from the slope
+    # of what has been read so far. Linking a character to anything nearby is not
+    # enough: the links are transitive, and on a page tilted enough to matter the
+    # end of one line sits at the height of the start of the next, so a chain
+    # walks across the gap and welds two lines into one. Following a *direction*
+    # cannot make that jump, because the next line is never ahead in the
+    # direction the current one is travelling.
+    for seed in order:
+        if taken[seed]:
+            continue
+        line = [seed]
+        taken[seed] = True
+        for direction in (1, -1):
+            slope = 0.0
+            cx, cy = xy[seed]
+            while True:
+                ahead = (xy[:, 0] - cx) * direction
+                dy = xy[:, 1] - (cy + slope * ahead * direction)
+                ok = (~taken) & (ahead > 0) & (ahead <= reach_x) & (np.abs(dy) <= corridor)
+                if not ok.any():
+                    break
+                cand = np.where(ok)[0]
+                nxt = cand[np.argmin(ahead[cand])]
+                line.append(nxt)
+                taken[nxt] = True
+                cx, cy = xy[nxt]
+                # Re-estimate the direction from the tail of the line, so the fit
+                # tracks a line that bends instead of drifting off it.
+                tail = line[-8:] if direction == 1 else line[-8:]
+                if len(tail) >= 3:
+                    t = xy[tail]
+                    if t[:, 0].max() - t[:, 0].min() > 1e-6:
+                        slope = float(np.polyfit(t[:, 0], t[:, 1], 1)[0]) * direction
+        if len(line) >= MIN_CHARS_PER_LINE:
+            groups.append([pts[i] for i in sorted(line, key=lambda i: xy[i, 0])])
 
-    def union(i, j):
-        a, b = find(i), find(j)
-        if a != b:
-            parent[b] = a
-
-    # A character is followed by its neighbours in reading order, so only a
-    # short window ahead in the x-sorted list needs checking.
-    reach_x = 2.5 * med_h
-    reach_y = 0.5 * med_h
-    window = 40
-    for i in range(n):
-        xi, yi = xy[i]
-        for j in range(i + 1, min(n, i + window)):
-            dx = xy[j, 0] - xi
-            if dx > reach_x:
-                break
-            if abs(xy[j, 1] - yi) <= reach_y:
-                union(i, j)
-
-    chains: dict = {}
-    for i, p in enumerate(pts):
-        chains.setdefault(find(i), []).append(p)
-    groups = [sorted(g, key=lambda p: p[0]) for g in chains.values()
-              if len(g) >= MIN_CHARS_PER_LINE]
     groups.sort(key=lambda g: float(np.mean([p[1] for p in g])))
     return groups
 
@@ -176,6 +202,65 @@ def fan_degrees(groups: list) -> float:
     return abs(float(np.polyfit(y, a, 1)[0] * (y.max() - y.min())))
 
 
+def _horizon(baselines: list, v_text: np.ndarray) -> np.ndarray | None:
+    """The vanishing line, from the fact that ruled lines are evenly spaced.
+
+    The horizon has to pass through the text's vanishing point, which leaves one
+    degree of freedom. Pinning it needs a second measurement, and the obvious
+    one — where the left-hand margin converges with the right — is not available
+    here: STaM justifies the right margin and lets the left fall where the words
+    end. Measured across these pages the right margin sits within 12-32 px of a
+    straight line and the left within 66-132, so half the fit was noise, and the
+    correction it produced moved a corner by 49-65% of the image.
+
+    Line *spacing* is the sounder constraint. The lines are ruled into the skin
+    before a word is written, so on the parchment they are parallel and evenly
+    spaced; in the photograph they crowd together as they recede, at a rate that
+    fixes the horizon exactly. Twenty ruled lines, not two ragged margins.
+    """
+    vx, vy, vw = float(v_text[0]), float(v_text[1]), float(v_text[2])
+
+    # Each near-horizontal baseline meets the vertical axis at a height that is
+    # all the projective row of the matrix acts on, so the search is over one
+    # scalar and the rest follows from the constraint.
+    heights = []
+    for line in baselines:
+        if abs(line[1]) < 1e-9:
+            continue
+        heights.append(-line[2] / line[1])
+    if len(heights) < MIN_LINES:
+        return None
+    heights = np.sort(np.array(heights))
+
+    def unevenness(b: float) -> float:
+        denom = b * heights + 1.0
+        if np.any(np.abs(denom) < 1e-6):
+            return np.inf
+        y = heights / denom
+        d = np.diff(np.sort(y))
+        if len(d) < 2 or np.any(d <= 0):
+            return np.inf
+        return float(np.std(d) / np.mean(d))
+
+    span = max(abs(heights).max(), 1.0)
+    grid = np.linspace(-4.0 / span, 4.0 / span, 801)
+    scores = [unevenness(b) for b in grid]
+    best = int(np.argmin(scores))
+    if not np.isfinite(scores[best]):
+        return None
+    # refine around the winner
+    lo = grid[max(0, best - 1)]
+    hi = grid[min(len(grid) - 1, best + 1)]
+    fine = np.linspace(lo, hi, 201)
+    b = float(fine[int(np.argmin([unevenness(v) for v in fine]))])
+
+    # The horizon passes through the text vanishing point: a*vx + b*vy + vw = 0.
+    if abs(vx) < 1e-9:
+        return None
+    a = -(b * vy + vw) / vx
+    return np.array([a, b, 1.0])
+
+
 def homography(groups: list, shape: tuple) -> np.ndarray | None:
     """Map the keystoned page onto a flat one, or None if it cannot be trusted."""
     h, w = shape[:2]
@@ -184,23 +269,29 @@ def homography(groups: list, shape: tuple) -> np.ndarray | None:
     # at coordinates in the thousands loses the precision it needs.
     T = np.array([[1.0, 0, -cx], [0, 1.0, -cy], [0, 0, 1.0]])
 
-    baselines, right, left = [], [], []
+    baselines, right = [], []
     for g in groups:
         pts = np.array([[p[0] - cx, p[1] - cy] for p in g])
         baselines.append(_fit(pts))
         right.append(pts[np.argmax(pts[:, 0])])
-        left.append(pts[np.argmin(pts[:, 0])])
 
     v_text = _intersect(baselines)
-    v_col = _intersect([_fit(np.array(right)), _fit(np.array(left))])
-
-    horizon = np.cross(v_text, v_col)
-    if abs(horizon[2]) < 1e-12:
-        return None                       # already parallel; nothing to undo
-    horizon = horizon / horizon[2]
+    horizon = _horizon(baselines, v_text)
+    if horizon is None:
+        return None
     Hp = np.array([[1.0, 0, 0], [0, 1.0, 0], [horizon[0], horizon[1], 1.0]])
 
-    d1, d2 = Hp @ v_text, Hp @ v_col
+    # The column direction comes from the justified margin alone, measured after
+    # the projective part has been undone, where it is a straight line again.
+    rp = np.array(right, float)
+    moved = cv2.perspectiveTransform(rp.reshape(-1, 1, 2).astype(np.float32),
+                                     Hp).reshape(-1, 2)
+    if not np.all(np.isfinite(moved)):
+        return None
+    col = _fit(moved)
+    v_col = np.array([-col[1], col[0], 0.0])          # direction along that margin
+
+    d1, d2 = Hp @ v_text, v_col
     n1, n2 = np.linalg.norm(d1[:2]), np.linalg.norm(d2[:2])
     if n1 < 1e-9 or n2 < 1e-9:
         return None
