@@ -132,6 +132,7 @@ class CropRecord:
     denoised: bool = False      # whether the denoiser actually fired
     fan: float = 0.0            # degrees of keystone measured across the text
     rectified: bool = False     # whether the keystone correction actually fired
+    rect_reason: str = ""       # which guard declined, when it did
 
 
 def _load_set(path: Path | None) -> set[str] | None:
@@ -242,6 +243,7 @@ def stage_crop(bench: Path, run_dir: Path, model_path: str, only: list[str] | No
             rec.denoised = bool(diag.get("denoised", False))
             rec.fan = round(diag.get("fan") or 0.0, 2)
             rec.rectified = bool(diag.get("rectified", False))
+            rec.rect_reason = diag.get("rect_reason", "") or ""
             emit(rec)
 
     if not records:

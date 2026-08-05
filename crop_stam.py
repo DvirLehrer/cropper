@@ -768,6 +768,10 @@ def crop_image(model, img_path: str, out_dir: str, conf: float = CONF) -> bool:
         cropped, rect_H, rect_info = rectify.rectify(cropped, moved, fill=bg_color)
         LAST_DIAG['fan'] = rect_info.get('fan')
         LAST_DIAG['rectified'] = rect_info.get('rectified')
+        # Which guard turned it down. Without this a refusal is indistinguishable
+        # from a page that needed nothing, and the first run could not tell them
+        # apart on the two images that mattered.
+        LAST_DIAG['rect_reason'] = rect_info.get('reason')
         if rect_H is not None:
             box_H = rect_H @ box_H
 
